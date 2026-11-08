@@ -154,9 +154,11 @@ function addLiveGlobals(ctx) {
   ctx.RegionFilter = { init() {}, getSelected: () => null, onRegionChange: () => {} };
 }
 
-function makeLiveSandbox({ withAppJs = false } = {}) {
+function makeLiveSandbox({ withAppJs = false, storage = {} } = {}) {
   const ctx = makeSandbox();
   addLiveGlobals(ctx);
+  // bxmesh: what the viewer's browser already holds, before live.js reads it.
+  for (const [k, v] of Object.entries(storage)) ctx.localStorage.setItem(k, v);
 
   loadInCtx(ctx, 'public/payload-labels.js');
   loadInCtx(ctx, 'public/roles.js');
@@ -666,7 +668,8 @@ console.log('\n=== live.js: feed timestamp refresh (#701) ===');
 // ===== resolveHopPositions =====
 console.log('\n=== live.js: resolveHopPositions ===');
 {
-  const ctx = makeLiveSandbox();
+  // bxmesh: Inferred Hops is off by default here, so these run with it on, as upstream's do.
+  const ctx = makeLiveSandbox({ storage: { 'live-ghost-hops': 'true' } });
   const resolve = ctx.window._liveResolveHopPositions;
   const nodeData = ctx.window._liveNodeData();
   const nodeMarkers = ctx.window._liveNodeMarkers();
@@ -750,6 +753,72 @@ console.log('\n=== live.js: resolveHopPositions ===');
     assert.ok(ghost.pos[1] > -122.0 && ghost.pos[1] < -121.0, 'ghost lon should be interpolated');
     delete nodeData['n1'];
     delete nodeData['n2'];
+  });
+}
+
+// ===== bxmesh: Inferred Hops starts off =====
+console.log('\n=== live.js: Inferred Hops off by default (bxmesh) ===');
+{
+  const mockResolver = {
+    init() {}, ready() { return true; },
+    resolve(hops) {
+      const map = {};
+      for (const h of hops) {
+        if (h === 'h1') map[h] = { name: 'N1', pubkey: 'n1' };
+        else if (h === 'h3') map[h] = { name: 'N2', pubkey: 'n2' };
+        else map[h] = { name: null, pubkey: null };
+      }
+      return map;
+    },
+  };
+  const positions = (storage) => {
+    const ctx = makeLiveSandbox({ storage });
+    const nodeData = ctx.window._liveNodeData();
+    nodeData['n1'] = { public_key: 'n1', name: 'N1', lat: 37.0, lon: -122.0 };
+    nodeData['n2'] = { public_key: 'n2', name: 'N2', lat: 38.0, lon: -121.0 };
+    ctx.HopResolver = mockResolver;
+    ctx.window.HopResolver = mockResolver;
+    return ctx.window._liveResolveHopPositions(['h1', 'h2', 'h3'], {});
+  };
+
+  test('a viewer who never set it sees no inferred hop', () => {
+    const result = positions({});
+    assert.ok(!result.some(r => r.ghost), 'no ghost hop by default');
+    assert.strictEqual(result.length, 2, 'only the two known hops');
+  });
+
+  test('a viewer who turned it on still sees inferred hops', () => {
+    assert.ok(positions({ 'live-ghost-hops': 'true' }).some(r => r.ghost));
+  });
+
+  test('a viewer who turned it off sees none', () => {
+    assert.ok(!positions({ 'live-ghost-hops': 'false' }).some(r => r.ghost));
+  });
+}
+
+// ===== bxmesh: Realistic starts on =====
+console.log('\n=== live.js: Realistic on by default (bxmesh) ===');
+{
+  // Realistic holds each packet for PROPAGATION_BUFFER_MS, gathering every observer's copy, before
+  // drawing them together; without it each copy is drawn as it arrives.
+  const holds = (storage) => {
+    const ctx = makeLiveSandbox({ storage });
+    const waits = [];
+    ctx.setTimeout = (cb, ms) => { waits.push(ms); return 0; };
+    ctx.window._liveBufferPacket({ hash: 'realistic1', decoded: { header: { payloadTypeName: 'GRP_TXT' }, payload: {} } });
+    return waits.includes(ctx.window.PROPAGATION_BUFFER_MS);
+  };
+
+  test('a viewer who never set it gets Realistic', () => {
+    assert.ok(holds({}), 'the packet should wait for its other observers');
+  });
+
+  test('a viewer who turned it off draws each copy as it arrives', () => {
+    assert.ok(!holds({ 'live-realistic-propagation': 'false' }));
+  });
+
+  test('a viewer who turned it on keeps it', () => {
+    assert.ok(holds({ 'live-realistic-propagation': 'true' }));
   });
 }
 

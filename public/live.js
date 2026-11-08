@@ -55,8 +55,10 @@
   // keeps them honest). Nothing else writes 'meshcore-live-heatmap' -- checked
   // across the tree, the only writer is the heat onChange below.
   let heatEnabled = localStorage.getItem('meshcore-live-heatmap') !== 'false';
-  let showGhostHops = localStorage.getItem('live-ghost-hops') !== 'false';
-  let realisticPropagation = localStorage.getItem('live-realistic-propagation') === 'true';
+  // bxmesh: off unless the viewer turns it on (github.com/bxmesh/corescope, BXMESH.md).
+  let showGhostHops = localStorage.getItem('live-ghost-hops') === 'true';
+  // bxmesh: on unless the viewer turns it off, so each packet is drawn with every observer's path.
+  let realisticPropagation = localStorage.getItem('live-realistic-propagation') !== 'false';
   let showOnlyFavorites = localStorage.getItem('live-favorites-only') === 'true';
   let multibyteOnly = localStorage.getItem('live-multibyte-only') === 'true';
   let matrixMode = localStorage.getItem('live-matrix-mode') === 'true';
@@ -1279,9 +1281,9 @@
             <div class="live-toggles">
             <label><input type="checkbox" id="liveHeatToggle" checked aria-describedby="heatDesc"> Heat</label>
             <span id="heatDesc" class="sr-only">Overlay a density heat map on the mesh nodes</span>
-            <label><input type="checkbox" id="liveGhostToggle" checked aria-describedby="ghostDesc"> Inferred Hops</label>
+            <label><input type="checkbox" id="liveGhostToggle" aria-describedby="ghostDesc"> Inferred Hops</label>
             <span id="ghostDesc" class="sr-only">Show inferred hop markers for unknown hops</span>
-            <label><input type="checkbox" id="liveRealisticToggle" aria-describedby="realisticDesc"> Realistic</label>
+            <label><input type="checkbox" id="liveRealisticToggle" checked aria-describedby="realisticDesc"> Realistic</label>
             <span id="realisticDesc" class="sr-only">Buffer packets by hash and animate all paths simultaneously</span>
             <label><input type="checkbox" id="liveColorHashToggle" aria-describedby="colorHashDesc"> Color by hash</label>
             <span id="colorHashDesc" class="sr-only">Color flying-packet dots and contrails by packet hash for propagation tracing</span>
