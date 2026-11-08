@@ -796,6 +796,32 @@ console.log('\n=== live.js: Inferred Hops off by default (bxmesh) ===');
   });
 }
 
+// ===== bxmesh: Realistic starts on =====
+console.log('\n=== live.js: Realistic on by default (bxmesh) ===');
+{
+  // Realistic holds each packet for PROPAGATION_BUFFER_MS, gathering every observer's copy, before
+  // drawing them together; without it each copy is drawn as it arrives.
+  const holds = (storage) => {
+    const ctx = makeLiveSandbox({ storage });
+    const waits = [];
+    ctx.setTimeout = (cb, ms) => { waits.push(ms); return 0; };
+    ctx.window._liveBufferPacket({ hash: 'realistic1', decoded: { header: { payloadTypeName: 'GRP_TXT' }, payload: {} } });
+    return waits.includes(ctx.window.PROPAGATION_BUFFER_MS);
+  };
+
+  test('a viewer who never set it gets Realistic', () => {
+    assert.ok(holds({}), 'the packet should wait for its other observers');
+  });
+
+  test('a viewer who turned it off draws each copy as it arrives', () => {
+    assert.ok(!holds({ 'live-realistic-propagation': 'false' }));
+  });
+
+  test('a viewer who turned it on keeps it', () => {
+    assert.ok(holds({ 'live-realistic-propagation': 'true' }));
+  });
+}
+
 // ===== bufferPacket and VCR buffer management =====
 console.log('\n=== live.js: bufferPacket / VCR buffer ===');
 {

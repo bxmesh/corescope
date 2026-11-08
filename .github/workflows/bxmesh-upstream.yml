@@ -40,7 +40,7 @@ jobs:
           {
             echo "Upstream released [$latest](https://github.com/$UPSTREAM/releases/tag/$latest); this fork is on $ours."
             echo
-            echo "1. Read its changelog. Does upstream now start Inferred Hops off, or have a setting for it? Then the fork has done its job: archive it and put corescope.bxmesh.net back on upstream's image (BXMESH.md)."
+            echo "1. Read its changelog. Does upstream now start Inferred Hops off and Realistic on, or have settings for them? Then the fork has done its job: archive it and put corescope.bxmesh.net back on upstream's image (BXMESH.md)."
             echo "2. Otherwise, \`bxmesh/sync.sh $latest\`, then a pull request to \`bxmesh\` with the changelog, risks and rollback."
             echo "3. Once that's merged and built, Renovate opens the bump in corescope.bxmesh.net."
           } > "$RUNNER_TEMP/body.md"
