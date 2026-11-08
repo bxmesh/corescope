@@ -55,7 +55,8 @@
   // keeps them honest). Nothing else writes 'meshcore-live-heatmap' -- checked
   // across the tree, the only writer is the heat onChange below.
   let heatEnabled = localStorage.getItem('meshcore-live-heatmap') !== 'false';
-  let showGhostHops = localStorage.getItem('live-ghost-hops') !== 'false';
+  // bxmesh: off unless the viewer turns it on (github.com/bxmesh/corescope, BXMESH.md).
+  let showGhostHops = localStorage.getItem('live-ghost-hops') === 'true';
   let realisticPropagation = localStorage.getItem('live-realistic-propagation') === 'true';
   let showOnlyFavorites = localStorage.getItem('live-favorites-only') === 'true';
   let multibyteOnly = localStorage.getItem('live-multibyte-only') === 'true';
@@ -1279,7 +1280,7 @@
             <div class="live-toggles">
             <label><input type="checkbox" id="liveHeatToggle" checked aria-describedby="heatDesc"> Heat</label>
             <span id="heatDesc" class="sr-only">Overlay a density heat map on the mesh nodes</span>
-            <label><input type="checkbox" id="liveGhostToggle" checked aria-describedby="ghostDesc"> Inferred Hops</label>
+            <label><input type="checkbox" id="liveGhostToggle" aria-describedby="ghostDesc"> Inferred Hops</label>
             <span id="ghostDesc" class="sr-only">Show inferred hop markers for unknown hops</span>
             <label><input type="checkbox" id="liveRealisticToggle" aria-describedby="realisticDesc"> Realistic</label>
             <span id="realisticDesc" class="sr-only">Buffer packets by hash and animate all paths simultaneously</span>
