@@ -1,6 +1,6 @@
 /**
  * E2E: live "Multibyte only" toggle.
- *   1. Toggle exists in live controls and defaults OFF.
+ *   1. Toggle exists in live controls and defaults ON (bxmesh's fork; upstream's is OFF).
  *   2. With it ON, a single-byte synthetic packet does NOT create a feed item,
  *      while a multibyte one does.
  *   3. Turning it OFF and rebuilding shows the previously-hidden single-byte pkt.
@@ -56,7 +56,7 @@ function makePkt(hash, rawHex) {
 
   console.log('\n=== live multibyte-only E2E against ' + BASE + ' ===');
 
-  await step('navigate to /#/live, toggle exists and defaults OFF', async () => {
+  await step('navigate to /#/live, toggle exists and defaults ON (bxmesh)', async () => {
     await page.addInitScript(() => {
       try { localStorage.removeItem('live-multibyte-only'); } catch (e) {}
     });
@@ -65,7 +65,7 @@ function makePkt(hash, rawHex) {
     const cb = await page.$('#liveMultibyteToggle');
     assert(cb, '#liveMultibyteToggle must exist in the live controls');
     const checked = await page.evaluate(() => document.getElementById('liveMultibyteToggle').checked);
-    assert(checked === false, 'multibyte toggle must default OFF');
+    assert(checked === true, 'multibyte toggle must default ON (bxmesh)');
   });
 
   const singleHash = 'mb-single-' + Date.now().toString(16);

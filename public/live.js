@@ -60,7 +60,8 @@
   // bxmesh: on unless the viewer turns it off, so each packet is drawn with every observer's path.
   let realisticPropagation = localStorage.getItem('live-realistic-propagation') !== 'false';
   let showOnlyFavorites = localStorage.getItem('live-favorites-only') === 'true';
-  let multibyteOnly = localStorage.getItem('live-multibyte-only') === 'true';
+  // bxmesh: on unless the viewer turns it off, so packets with 1-byte hops aren't drawn.
+  let multibyteOnly = localStorage.getItem('live-multibyte-only') !== 'false';
   let matrixMode = localStorage.getItem('live-matrix-mode') === 'true';
   let matrixRain = localStorage.getItem('live-matrix-rain') === 'true';
   let colorByHash = localStorage.getItem('meshcore-color-packets-by-hash') !== 'false';
@@ -1295,7 +1296,7 @@
             <span id="audioDesc" class="sr-only">Sonify packets — turn raw bytes into generative music</span>
             <label><input type="checkbox" id="liveFavoritesToggle" aria-describedby="favDesc"> ⭐ Favorites</label>
             <span id="favDesc" class="sr-only">Show only favorited and claimed nodes</span>
-            <label><input type="checkbox" id="liveMultibyteToggle" aria-describedby="multibyteDesc"> Multibyte only</label>
+            <label><input type="checkbox" id="liveMultibyteToggle" checked aria-describedby="multibyteDesc"> Multibyte only</label>
             <span id="multibyteDesc" class="sr-only">Show only multibyte (≥2-byte path-hash) packets; hide unreliable single-byte traffic</span>
             <label id="liveGeoFilterLabel" style="display:none"><input type="checkbox" id="liveGeoFilterToggle"> Mesh live area</label>
             </div>
