@@ -822,6 +822,32 @@ console.log('\n=== live.js: Realistic on by default (bxmesh) ===');
   });
 }
 
+// ===== bxmesh: Multibyte only starts on =====
+console.log('\n=== live.js: Multibyte only on by default (bxmesh) ===');
+{
+  // With Multibyte only on, each packet's hash size is checked and a 1-byte one isn't drawn; off,
+  // nothing is checked. Realistic is turned off here so the packet is drawn at once.
+  const checks = (storage) => {
+    const ctx = makeLiveSandbox({ storage: Object.assign({ 'live-realistic-propagation': 'false' }, storage) });
+    let asked = 0;
+    ctx.window.MC_packetHashSize = () => { asked++; return 1; };
+    ctx.window._liveBufferPacket({ hash: 'multibyte1', raw_hex: '00', decoded: { header: { payloadTypeName: 'GRP_TXT' }, payload: {} } });
+    return asked > 0;
+  };
+
+  test('a viewer who never set it gets Multibyte only', () => {
+    assert.ok(checks({}), 'the packet should be checked for 1-byte hops');
+  });
+
+  test('a viewer who turned it off sees every packet', () => {
+    assert.ok(!checks({ 'live-multibyte-only': 'false' }));
+  });
+
+  test('a viewer who turned it on keeps it', () => {
+    assert.ok(checks({ 'live-multibyte-only': 'true' }));
+  });
+}
+
 // ===== bufferPacket and VCR buffer management =====
 console.log('\n=== live.js: bufferPacket / VCR buffer ===');
 {
