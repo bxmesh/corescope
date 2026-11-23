@@ -2,6 +2,7 @@
  * loaded in a vm sandbox, same pattern as test-frontend-helpers.js. */
 'use strict';
 const vm = require('vm');
+const { loadApiBase } = require('./api-base-sandbox');
 const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
@@ -80,6 +81,7 @@ function makeEnv(routes) {
   };
   ctx.globalThis = ctx;
   vm.createContext(ctx);
+  loadApiBase(ctx);
   vm.runInContext(fs.readFileSync(path.join(ROOT, 'public/auth.js'), 'utf8'), ctx);
   return { win, els, events, calls, loc };
 }
@@ -96,6 +98,7 @@ test('inert when the server does not advertise userManagement', async () => {
     console, Promise, JSON, String, Object, setTimeout, clearTimeout, CustomEvent: function () {},
     escapeHtml: loadEscapeHtml(), fetch() { calls.push(1); return Promise.reject(new Error('no')); } };
   vm.createContext(ctx);
+  loadApiBase(ctx);
   vm.runInContext(fs.readFileSync(path.join(ROOT, 'public/auth.js'), 'utf8'), ctx);
   await win.CSAuth.ready();
   assert.strictEqual(win.CSAuth.isEnabled(), false);
@@ -126,6 +129,26 @@ test('login state is loaded from /api/auth/me and announced', async () => {
   await env.win.CSAuth.ready();
   assert.strictEqual(env.win.CS_USER.displayName, 'Ann');
   assert(env.events.some((e) => e.type === 'cs-auth-changed'));
+});
+
+test('initial account control announces layout before session lookup completes without changing the user', async () => {
+  let release;
+  const session = new Promise(resolve => { release = resolve; });
+  const env = makeEnv(() => ({ status: 200, body: session }));
+  // Bootstrap is queued on MeshConfigReady; the session response stays pending.
+  await Promise.resolve();
+  try {
+    assert(env.els.accountWrap.innerHTML.includes('href="#/account/login"'));
+    assert.strictEqual(env.events.filter(e => e.type === 'cs-auth-control-added').length, 1);
+    assert.strictEqual(env.events.filter(e => e.type === 'cs-auth-changed').length, 0);
+    assert.strictEqual(env.win.CS_USER, undefined);
+  } finally {
+    release(ME);
+    await env.win.CSAuth.ready();
+  }
+  assert.strictEqual(env.events.filter(e => e.type === 'cs-auth-control-added').length, 1);
+  assert.strictEqual(env.events.filter(e => e.type === 'cs-auth-changed').length, 1);
+  assert.strictEqual(env.win.CS_USER, ME);
 });
 
 test('CSRF header only on non-GET requests', async () => {
@@ -290,6 +313,7 @@ function sliceBetween(file, from, to) {
 function loadNav(file, from, to, fn, win) {
   const sb = { window: Object.assign({ addEventListener() {} }, win), console };
   vm.createContext(sb);
+  loadApiBase(sb);
   vm.runInContext(sliceBetween(file, from, to) + '\nthis.fn = ' + fn + ';', sb);
   return sb.fn;
 }
@@ -358,6 +382,7 @@ function loadAccount(hash, routes, extraWin) {
     history: { replaceState(a, b, h) { replaced.push(h); loc.hash = h; } },
     escapeHtml: loadEscapeHtml(), registerPage(n, m) { pages[n] = m; }, viewGeneration: () => 0, console };
   vm.createContext(ctx);
+  loadApiBase(ctx);
   Object.assign(CSAuth, loadAuthHelpers(ctx));
   vm.runInContext(fs.readFileSync(path.join(ROOT, 'public/account.js'), 'utf8'), ctx);
   return { setRequest(f) { override = f; }, doc, t: ctx.window.CSAccount._test, els, calls, loc, user, pages, logouts, replaced,
@@ -430,6 +455,88 @@ test('profile view has a Companions section below Devices', () => {
   const dev = html.indexOf('<h3>Devices</h3>'), comp = html.indexOf('<h3>Companions</h3>');
   assert(dev !== -1 && comp > dev, 'Companions heading missing or above Devices');
   assert(html.indexOf('id="compList"') !== -1 && html.indexOf('id="compMsg"') !== -1);
+});
+
+const OBS_ON = { MC_USER_MGMT: { enabled: true, observerLogins: true } };
+const OBS_LOGIN = (o) => ({ login: Object.assign({ username: 'obs_abc123def456', createdAt: '2026-10-25T10:00:00Z', revoked: false }, o),
+  observers: [{ pubkey: 'AB'.repeat(32), name: 'Roof', lastSeenAt: null }] });
+
+test('observer login section: only with observerLogins on, below Companions, anchored for section=observers', () => {
+  const off = loadAccount('#/account', () => ({}));
+  assert.strictEqual(off.t.profileHtml({ email: 'a@b.c', role: 'user', displayName: 'Ann' }).indexOf('Observer MQTT login'), -1);
+  const env = loadAccount('#/account', () => ({}), OBS_ON);
+  const html = env.t.profileHtml({ email: 'a@b.c', role: 'user', displayName: 'Ann' });
+  const comp = html.indexOf('<h3>Companions</h3>'), obs = html.indexOf('<h3 id="observers">Observer MQTT login</h3>');
+  assert(comp !== -1 && obs > comp, 'section missing or above Companions');
+  assert(html.indexOf('id="obsLoginSection"') !== -1 && html.indexOf('id="obsLoginMsg"') !== -1);
+});
+
+test('observer login states: request text with the escaped address, login with observers, revoked', () => {
+  const t = loadAccount('#/account', () => ({}), OBS_ON).t;
+  const none = t.observerLoginHtml({ login: null }, '<b>x</b>@e.org');
+  assert(none.indexOf('Request a personal login for your observers. The credentials are sent to <strong>&lt;b&gt;x&lt;/b&gt;@e.org</strong>.') !== -1, none);
+  assert(none.indexOf('>Request observer login</button>') !== -1);
+  const has = t.observerLoginHtml(OBS_LOGIN(), 'a@b.c');
+  assert(has.indexOf('<code id="obsLoginUser">obs_abc123def456</code>') !== -1, has);
+  assert(has.indexOf('data-pubkey="' + 'AB'.repeat(32) + '"') !== -1 && has.indexOf('Roof') !== -1 && has.indexOf('last seen never') !== -1, has);
+  assert(has.indexOf('>Mail my credentials again</button>') !== -1);
+  const empty = t.observerLoginHtml({ login: OBS_LOGIN().login, observers: [] }, 'a@b.c');
+  assert(empty.indexOf('No observers linked yet.') !== -1, empty);
+  const rev = t.observerLoginHtml(OBS_LOGIN({ revoked: true }), 'a@b.c');
+  assert(rev.indexOf('<p class="account-hint" id="obsLoginRevoked">Your observer login was revoked. Contact the administrator.</p>') !== -1, rev);
+  assert(rev.indexOf('obsLoginResend') === -1 && rev.indexOf('obsLoginRequest') === -1, 'a button while revoked');
+});
+
+test('observer login escapes username and observer fields; a password in the data is never rendered', () => {
+  const t = loadAccount('#/account', () => ({}), OBS_ON).t;
+  const d = { login: { username: '<img src=x>', createdAt: 'x', revoked: false, password: 'SECRETSECRETSECRETSECRETSECRET12' },
+    observers: [{ pubkey: '"><b>', name: '<i>n</i>', lastSeenAt: null }] };
+  const h = t.observerLoginHtml(d, 'a@b.c');
+  assert(h.indexOf('<img') === -1 && h.indexOf('<b>') === -1 && h.indexOf('<i>') === -1, h);
+  assert(h.indexOf('SECRET') === -1, 'password rendered');
+});
+
+test('Request observer login posts, says the mail went out and reloads the section', async () => {
+  let login = null;
+  const env = loadAccount('#/account', (p) => {
+    if (p === '/api/account/observer-login') return login === null ? { ok: true, status: 200, data: { login: null } } : { ok: true, status: 200, data: login };
+    return { ok: true, status: 200, data: [] };
+  }, OBS_ON);
+  env.setRequest((method, p) => {
+    if (method === 'POST' && p === '/api/account/observer-login') { login = OBS_LOGIN(); return Promise.resolve({ ok: true, status: 201, data: { sent: true } }); }
+    if (p === '/api/account/observer-login') return Promise.resolve({ ok: true, status: 200, data: login || { login: null } });
+    return Promise.resolve({ ok: true, status: 200, data: [] });
+  });
+  env.user.current = { id: 1, email: 'a@b.c', displayName: 'Ann', role: 'user' };
+  env.t.views.profile({ set innerHTML(v) {} });
+  await new Promise((r) => setTimeout(r, 5));
+  assert(env.els.obsLoginSection.innerHTML.indexOf('id="obsLoginRequest"') !== -1, env.els.obsLoginSection.innerHTML);
+  const btn = { id: 'obsLoginRequest', disabled: false };
+  await env.els.obsLoginSection.handlers.click({ target: btn });
+  assert(env.calls.some((c) => c.method === 'POST' && c.p === '/api/account/observer-login'), 'no POST');
+  assert.strictEqual(env.els.obsLoginMsg.textContent, 'Sent. Check your mailbox at a@b.c.');
+  assert(env.els.obsLoginSection.innerHTML.indexOf('obs_abc123def456') !== -1, 'not reloaded');
+  assert.strictEqual(btn.disabled, false, 'button left disabled');
+});
+
+test('Mail my credentials again: a 429 shows the server error and keeps the login shown', async () => {
+  const env = loadAccount('#/account', () => ({}), OBS_ON);
+  env.setRequest((method, p) => {
+    if (p === '/api/account/observer-login/resend') return Promise.resolve({ ok: false, status: 429, data: { error: 'too many credential mails, try again later' } });
+    if (p === '/api/account/observer-login') return Promise.resolve({ ok: true, status: 200, data: OBS_LOGIN() });
+    return Promise.resolve({ ok: true, status: 200, data: [] });
+  });
+  env.user.current = { id: 1, email: 'a@b.c', displayName: 'Ann', role: 'user' };
+  env.t.views.profile({ set innerHTML(v) {} });
+  await new Promise((r) => setTimeout(r, 5));
+  await env.els.obsLoginSection.handlers.click({ target: { id: 'obsLoginResend' } });
+  assert(env.calls.some((c) => c.method === 'POST' && c.p === '/api/account/observer-login/resend'), 'no resend POST');
+  assert.strictEqual(env.els.obsLoginMsg.textContent, 'too many credential mails, try again later');
+  assert(env.els.obsLoginSection.innerHTML.indexOf('obsLoginResend') !== -1);
+});
+
+test('roles.js passes observerLogins from /api/config/client into MC_USER_MGMT', () => {
+  assert(/observerLogins: !!cfg\.userManagement\.observerLogins/.test(fs.readFileSync(path.join(ROOT, 'public/roles.js'), 'utf8')));
 });
 
 test('profile view lists companions; Unlink confirms, sends DELETE and reloads the list', async () => {
@@ -790,9 +897,10 @@ function loadAdmin(hash, routes, opts) {
   };
   const ctx = { window: { CSAuth }, document: doc, CSAuth, location: loc, URLSearchParams, Promise, String,
     history: { replaceState(a, b, h) { replaced.push(h); loc.hash = h; } },
-    confirm() { return true; }, debounce: (opts && opts.debounce) || function (fn) { return fn; },
+    confirm: (opts && opts.confirm) || function () { return true; }, debounce: (opts && opts.debounce) || function (fn) { return fn; },
     escapeHtml: loadEscapeHtml(), console };
   vm.createContext(ctx);
+  loadApiBase(ctx);
   Object.assign(CSAuth, loadAuthHelpers(ctx));
   vm.runInContext(fs.readFileSync(path.join(ROOT, 'public/admin-users.js'), 'utf8'), ctx);
   const app = { innerHTML: '', querySelector() { return els.umPage || (els.umPage = mk('umPage')); } };
@@ -838,6 +946,19 @@ test('row and detail rendering escape every dynamic field', () => {
     audit: [{ at: p, action: p, actorUserId: p }] });
   assert(det.indexOf('<img') === -1 && det.indexOf('<i>') === -1, 'raw markup in detail: ' + det);
   assert(det.indexOf('&lt;img src=x onerror=alert(1)&gt;') !== -1);
+});
+
+test('detail lists repeater claims escaped, with a Remove button, or an empty note', () => {
+  const env = adminEnv();
+  const p = '<img src=x onerror=alert(1)>';
+  const pk = 'aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11';
+  const det = env.t.detailHtml({ user: { id: 4, displayName: 'A', email: 'a@x' }, sessions: [], mail: [], audit: [],
+    repeaterClaims: [{ pubkey: pk, claimedAt: p }, { pubkey: p, claimedAt: p }] });
+  assert(det.indexOf('<img') === -1, 'raw markup in claims: ' + det);
+  assert(det.indexOf('href="#/nodes/' + pk + '"') !== -1);
+  assert(det.indexOf('data-act="unclaim" data-id="4" data-pubkey="' + pk + '"') !== -1);
+  const none = env.t.detailHtml({ user: { id: 4, displayName: 'A', email: 'a@x' }, sessions: [], mail: [], audit: [], repeaterClaims: [] });
+  assert(none.indexOf('No repeater claims.') !== -1 && none.indexOf('data-act="unclaim"') === -1);
 });
 
 test('deep link: filters, bouncing and detail id round-trip through the hash', () => {
@@ -912,6 +1033,26 @@ test('demoting yourself refreshes the session and leaves the page', async () => 
   await tick();
   assert.strictEqual(env.refreshed(), 1);
   assert.strictEqual(env.loc.hash, '#/account');
+});
+
+test('removing a repeater claim asks for confirmation first', async () => {
+  const PKX = 'aa'.repeat(32);
+  const click = (env) => env.els.umPage.handlers.click({ target: { closest: () => ({ getAttribute: (a) => ({ 'data-act': 'unclaim', 'data-id': '7', 'data-pubkey': PKX })[a] }) } });
+  const asked = [];
+  const no = loadAdmin('#/admin?tab=users', () => OK([]), { confirm: (t) => { asked.push(t); return false; } });
+  no.um.mount(no.app);
+  await tick();
+  click(no);
+  await tick();
+  assert.strictEqual(asked.length, 1);
+  assert(/repeater claim/.test(asked[0]));
+  assert(!no.calls.some((c) => c.method === 'DELETE'), 'declined confirm must not delete');
+  const yes = loadAdmin('#/admin?tab=users', () => OK([]), { confirm: () => true });
+  yes.um.mount(yes.app);
+  await tick();
+  click(yes);
+  await tick();
+  assert(yes.calls.some((c) => c.method === 'DELETE' && c.p === '/api/admin/repeaters/' + PKX + '/claims/7'));
 });
 
 test('readHash accepts only numeric ids and known status and role values', () => {
@@ -1005,6 +1146,7 @@ function loadPerf() {
     performance: { now: () => 0 }, registerPage() {} };
   ctx.globalThis = ctx;
   vm.createContext(ctx);
+  loadApiBase(ctx);
   vm.runInContext(fs.readFileSync(path.join(ROOT, 'public/perf.js'), 'utf8'), ctx);
   return ctx;
 }

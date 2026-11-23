@@ -2250,16 +2250,11 @@ func TestPerObservationRawHexEnrich(t *testing.T) {
 	for _, obs := range tx.Observations {
 		m := store.enrichObsWithTx(obs, store.byTxID[obs.TransmissionID])
 		rh, _ := m["raw_hex"].(string)
-		if obs.RawHex != "" {
-			// Observer A: should get per-observation raw_hex
-			if rh != obsAHex {
-				t.Errorf("obs with own raw_hex: got %q, want %q", rh, obsAHex)
-			}
-		} else {
-			// Observer B: should fall back to transmission raw_hex
-			if rh != txHex {
-				t.Errorf("obs without raw_hex: got %q, want %q (tx fallback)", rh, txHex)
-			}
+		ceAssertNoRaw(t, obs)
+		// Hot-store enrichment uses the representative frame for both.
+		// The packet-detail endpoint retrieves original frames separately.
+		if rh != txHex {
+			t.Errorf("obs without raw_hex: got %q, want %q (tx fallback)", rh, txHex)
 		}
 	}
 }
@@ -2314,6 +2309,24 @@ func TestGetScopeStats(t *testing.T) {
 	}
 	if stats.Summary.UnknownScope != 1 {
 		t.Errorf("UnknownScope = %d, want 1", stats.Summary.UnknownScope)
+	}
+	// #2364: per-route split of Unscoped, and a Total the summary adds up to.
+	s := stats.Summary
+	if s.UnscopedTransport != 1 || s.UnscopedFlood != 1 || s.UnscopedDirect != 1 {
+		t.Errorf("unscoped split = transport %d / flood %d / direct %d, want 1/1/1",
+			s.UnscopedTransport, s.UnscopedFlood, s.UnscopedDirect)
+	}
+	if s.Total != 5 {
+		t.Errorf("Total = %d, want 5 (all routes)", s.Total)
+	}
+	if s.TransportTotal != s.Scoped+s.UnscopedTransport {
+		t.Errorf("transportTotal %d != scoped %d + unscopedTransport %d", s.TransportTotal, s.Scoped, s.UnscopedTransport)
+	}
+	if s.Unscoped != s.UnscopedTransport+s.UnscopedFlood+s.UnscopedDirect {
+		t.Errorf("unscoped %d != sum of its route split", s.Unscoped)
+	}
+	if s.Total != s.Scoped+s.Unscoped {
+		t.Errorf("total %d != scoped %d + unscoped %d", s.Total, s.Scoped, s.Unscoped)
 	}
 	if len(stats.ByRegion) != 1 || stats.ByRegion[0].Name != "#belgium" || stats.ByRegion[0].Count != 1 {
 		t.Errorf("ByRegion = %+v, want [{#belgium 1}]", stats.ByRegion)

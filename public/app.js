@@ -3,11 +3,10 @@
 
 // --- Route/Payload name maps ---
 const ROUTE_TYPES = { 0: 'TRANSPORT_FLOOD', 1: 'FLOOD', 2: 'DIRECT', 3: 'TRANSPORT_DIRECT' };
-const PAYLOAD_TYPES = { 0: 'Request', 1: 'Response', 2: 'Direct Msg', 3: 'ACK', 4: 'Advert', 5: 'Channel Msg', 6: 'Group Data', 7: 'Anon Req', 8: 'Path', 9: 'Trace', 10: 'Multipart', 11: 'Control', 15: 'Raw Custom' };
 const PAYLOAD_COLORS = { 0: 'req', 1: 'response', 2: 'txt-msg', 3: 'ack', 4: 'advert', 5: 'grp-txt', 6: 'grp-data', 7: 'anon-req', 8: 'path', 9: 'trace', 10: 'multipart', 11: 'control', 15: 'raw-custom' };
 
 function routeTypeName(n) { return ROUTE_TYPES[n] || 'UNKNOWN'; }
-function payloadTypeName(n) { return PAYLOAD_TYPES[n] || 'UNKNOWN'; }
+function payloadTypeName(n) { return window.PayloadLabels.api.shortById(n) || 'UNKNOWN'; }
 function payloadTypeColor(n) { return PAYLOAD_COLORS[n] || 'unknown'; }
 function isTransportRoute(rt) { return rt === 0 || rt === 3; }
 /** Byte offset of path_len in raw_hex: 5 for transport routes (4 bytes of next/last hop codes precede it), 1 otherwise. */
@@ -131,11 +130,49 @@ const CLIENT_TTL = {
   nodeAnalytics: 60000, nodeSearch: 10000
 };
 // Fetch server cache config and use as client TTLs (server values are in seconds)
-fetch('/api/config/cache').then(r => r.json()).then(cfg => {
+CSApi.fetch('/api/config/cache').then(r => r.json()).then(cfg => {
   for (const [k, v] of Object.entries(cfg)) {
     if (k in CLIENT_TTL && typeof v === 'number') CLIENT_TTL[k] = v * 1000;
   }
 }).catch(() => {});
+// A packaged UI (a static host, the web container) can fail in two ways the
+// embedded UI never sees, and both would otherwise leave pages silently
+// empty. A blocked CORS request (the server does not list this origin)
+// rejects with a TypeError and no status: that becomes code
+// 'network_or_cors'. A wrong API base answers with a static host's HTML:
+// that becomes code 'not_json'. Each shows one toast a minute at most.
+const _apiProblemShownAt = {};
+function apiProblem(code, message, cause) {
+  const err = new Error(message);
+  err.code = code;
+  if (cause) err.cause = cause;
+  const now = Date.now();
+  if (!_apiProblemShownAt[code] || now - _apiProblemShownAt[code] > 60000) {
+    _apiProblemShownAt[code] = now;
+    if (window.CSAuth && typeof window.CSAuth.notify === 'function') window.CSAuth.notify(message);
+  }
+  return err;
+}
+async function apiFetchOrExplain(path) {
+  try {
+    return await CSApi.fetch('/api' + path);
+  } catch (e) {
+    if (CSApi.crossOrigin && e instanceof TypeError) throw apiProblem('network_or_cors', "Can't reach the CoreScope API", e);
+    throw e;
+  }
+}
+function rejectHtmlResponse(res, path) {
+  const ct = res.headers && typeof res.headers.get === 'function' ? res.headers.get('Content-Type') : null;
+  // Only HTML is refused: an /api answer is never a page, while some JSON
+  // handlers leave Content-Type to Go's sniffing (text/plain).
+  if (ct && /^text\/html/i.test(ct)) {
+    const err = apiProblem('not_json', 'Server returned an unexpected response');
+    err.status = res.status;
+    err.path = path;
+    err.retryAfter = res.headers.get('Retry-After');
+    throw err;
+  }
+}
 async function api(path, { ttl = 0, bust = false } = {}) {
   const t0 = performance.now();
   if (!bust && ttl > 0) {
@@ -170,7 +207,13 @@ async function api(path, { ttl = 0, bust = false } = {}) {
     let notified = false;
     try {
       while (true) {
-        const res = await fetch('/api' + path);
+        const res = await apiFetchOrExplain(path);
+        // On a packaged UI, a static host or proxy error page is not a server
+        // warm-up response, even when its status is 503: explain it before
+        // status/retry handling. The embedded UI keeps its old handling: a
+        // proxy's HTML 503 is retried below, and the server's SPA fallback for
+        // an unknown /api path fails to parse.
+        if (!CSApi.embedded) rejectHtmlResponse(res, path);
         if (res.status === 503 && attempt < maxAttempts) {
           const ra = parseInt(res.headers.get('Retry-After'), 10);
           const wait = isFinite(ra) && ra > 0 ? ra * 1000 : delay;
@@ -546,6 +589,15 @@ function formatTimestampWithTooltip(isoString, mode) {
   return { text, tooltip, isFuture };
 }
 
+function renderTimestampHtml(isoString) {
+  const f = formatTimestampWithTooltip(isoString);
+  const warn = f.isFuture
+    ? ' <span class="timestamp-future-icon" title="Timestamp is in the future — node clock may be skewed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>'
+    : '';
+  return `<span class="timestamp-text" title="${escapeHtml(f.tooltip)}">${escapeHtml(f.text)}</span>${warn}`;
+}
+window.renderTimestampHtml = renderTimestampHtml;
+
 // Format a Date for chart axis labels, respecting customizer timestamp settings.
 // shortForm: true = time only (for intra-day), false = date+time (multi-day).
 function formatChartAxisLabel(d, shortForm) {
@@ -874,8 +926,7 @@ function connectWS() {
   clearTimeout(wsReconnectTimer);
   wsReconnectTimer = null;
   dropWS();
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const sock = new WebSocket(`${proto}//${location.host}`);
+  const sock = new WebSocket(CSApi.wsUrl('/ws'));
   ws = sock;
   // Measured from creation, so a handshake that never completes is caught too.
   wsLastMessageAt = Date.now();
@@ -1149,21 +1200,76 @@ const pages = {};
 function registerPage(name, mod) { pages[name] = mod; }
 
 // Tools landing page — shows sub-menu with Trace and Path Inspector (spec §2.8, M1 fix).
+function toolsPlannerCardHtml() {
+  return '<a href="#/tools/planner" class="tools-card"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-trifold"/></svg> Repeater Planner</h3><p>Line of sight between points, the best relay for a link, and where new repeaters would best join the backbone.</p></a>';
+}
+let toolsLandingGen = 0;
 registerPage('tools-landing', {
   init: function (container) {
+    var gen = ++toolsLandingGen;
     container.innerHTML =
       '<div class="tools-landing">' +
         '<h2>Tools</h2>' +
         '<div class="tools-menu">' +
           '<a href="#/tools/path-inspector" class="tools-card"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> Path Inspector</h3><p>Resolve prefix paths to candidate full-pubkey routes with confidence scoring.</p></a>' +
+          (window.MC_PLANNER_CFG ? toolsPlannerCardHtml() : '') +
           '<a href="#/tools/trace/" class="tools-card"><h3><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-broadcast"/></svg> Trace Viewer</h3><p>View detailed packet traces by hash.</p></a>' +
         '</div>' +
       '</div>';
+    // Cold load: /api/config/client may not have answered yet, so the planner
+    // card is added once MeshConfigReady settles (same pattern as planner.js).
+    var ready = window.MeshConfigReady;
+    if (window.MC_PLANNER_CFG === undefined && ready && typeof ready.then === 'function') {
+      var addCard = function () {
+        if (gen !== toolsLandingGen || !window.MC_PLANNER_CFG) return;
+        var menu = container.querySelector && container.querySelector('.tools-menu');
+        if (!menu || menu.querySelector('a[href="#/tools/planner"]')) return;
+        var first = menu.firstElementChild;
+        if (first) first.insertAdjacentHTML('afterend', toolsPlannerCardHtml());
+        else menu.insertAdjacentHTML('beforeend', toolsPlannerCardHtml());
+      };
+      ready.then(addCard, function () {});
+    }
   },
-  destroy: function () {}
+  destroy: function () { toolsLandingGen++; }
 });
 
 let currentPage = null;
+
+// Keep branding separate so route changes and late theme loads cannot
+// overwrite one another or accumulate title suffixes (#2259).
+let _siteTitle = document.title || 'CoreScope';
+let _pageTitle = '';
+function setPageTitle(title) {
+  _pageTitle = title;
+  document.title = title ? title + ' | ' + _siteTitle : _siteTitle;
+}
+function setSiteTitle(title) {
+  _siteTitle = String(title || '').trim() || 'CoreScope';
+  setPageTitle(_pageTitle);
+}
+function routeTitle(page, param) {
+  const id = param ? param.split('/')[0].slice(0, 12) : '';
+  if (id && ['nodes', 'node-analytics', 'node-reach'].includes(page)) {
+    return 'Node ' + id + (page === 'node-reach' ? ' | Reach' : page === 'node-analytics' ? ' | Analytics' : '');
+  }
+  if (id && (page === 'packets' || page === 'packet-detail')) return 'Packet ' + id;
+  if (page === 'observer-detail') return 'Observer ' + id;
+  const names = {
+    home: '', packets: 'Packets', nodes: 'Nodes', map: 'Map', live: 'Live',
+    channels: 'Channels', observers: 'Observers', analytics: 'Analytics',
+    'scope-audit': 'Scope Audit', perf: 'Performance', 'audio-lab': 'Audio Lab',
+    'tools-landing': 'Tools', traces: 'Packet Trace', 'path-inspector': 'Path Inspector', planner: 'Repeater Planner',
+    account: 'Account', admin: 'Admin', compare: 'Observer Comparison', 'rx-coverage': 'RX Coverage',
+  };
+  return Object.prototype.hasOwnProperty.call(names, page) ? names[page] : 'Not Found';
+}
+function setRouteTitle(page, param) {
+  // Ignore a detail callback from a page the user already left.
+  if (currentPage === page || (page === 'packets' && currentPage === 'packet-detail')) {
+    setPageTitle(routeTitle(page, param));
+  }
+}
 
 // Bumped on every page init, so async page work can tell its visit is over:
 // capture viewGeneration() at init and drop the result when it has moved on
@@ -1248,6 +1354,10 @@ function navigate() {
     } else if (routeParam === 'path-inspector' || (routeParam && routeParam.startsWith('path-inspector'))) {
       basePage = 'path-inspector';
       routeParam = null;
+    } else if (routeParam === 'planner' || (routeParam && routeParam.startsWith('planner'))) {
+      // Repeater planner (#/tools/planner?mode=...); state lives in the hash query.
+      basePage = 'planner';
+      routeParam = null;
     } else if (!routeParam) {
       // Default tools landing shows menu with both entries.
       basePage = 'tools-landing';
@@ -1260,7 +1370,7 @@ function navigate() {
 
   // Update nav active state
   document.querySelectorAll('.nav-link[data-route]').forEach(el => {
-    el.classList.toggle('active', el.dataset.route === basePage || (el.dataset.route === 'tools' && (basePage === 'traces' || basePage === 'path-inspector' || basePage === 'tools-landing')));
+    el.classList.toggle('active', el.dataset.route === basePage || (el.dataset.route === 'tools' && (basePage === 'traces' || basePage === 'path-inspector' || basePage === 'planner' || basePage === 'tools-landing')));
   });
   // Update "More" button to show active state if a low-priority page is selected
   var moreBtn = document.getElementById('navMoreBtn');
@@ -1275,6 +1385,7 @@ function navigate() {
     pages[currentPage].destroy();
   }
   currentPage = basePage;
+  setRouteTitle(basePage, routeParam);
 
   // #1572 — defensive: ensure body.live-fullscreen is cleared whenever
   // we navigate to a non-live route. Live page's destroy() also clears
@@ -1500,6 +1611,10 @@ window.addEventListener('DOMContentLoaded', () => {
     var overflowQueue = buildOverflowQueue();
 
     function rebuildMoreMenu() {
+      // Removing a focused clone drops focus onto the body. Keep its
+      // destination whether the next fit leaves it in More or moves it inline.
+      const focused = navMoreMenu.contains(document.activeElement) ? document.activeElement : null;
+      let focusTarget = focused && allLinks.find(link => link.getAttribute('href') === focused.getAttribute('href'));
       navMoreMenu.innerHTML = '';
       const hidden = allLinks.filter(a => a.classList.contains('is-overflow'));
       hidden.forEach(function(link) {
@@ -1515,24 +1630,21 @@ window.addEventListener('DOMContentLoaded', () => {
         clone.addEventListener('click', closeNav);
         clone.addEventListener('click', closeMoreMenu);
         navMoreMenu.appendChild(clone);
+        if (link === focusTarget) focusTarget = clone;
       });
       // If nothing overflows, hide the More button entirely so wide
       // viewports don't show a useless dropdown trigger.
       navMoreWrap.classList.toggle('is-hidden', hidden.length === 0);
+      if (hidden.length === 0) closeMoreMenu();
       // Refresh active state on the More button (a hidden active link
       // means the More menu currently "is" the active section).
       var hasActiveMore = navMoreMenu.querySelector('.nav-link.active');
       navMoreBtn.classList.toggle('active', !!hasActiveMore);
+      if (focusTarget) focusTarget.focus();
     }
 
-    // #1105 MINOR 1: cached intrinsic width of the More button. Captured
-    // the first time `fits()` sees navMoreWrap rendered (display:flex).
-    // Falls back to MORE_BTN_RESERVE_PX (a conservative initial guess
-    // sized for "More ▾" at default font/padding) until that happens.
-    var cachedMoreW = 0;
-    var MORE_BTN_RESERVE_PX = 70;
-
     function applyNavPriority() {
+      navTop.classList.remove('nav-hide-stats', 'nav-compact');
       // Skip on mobile (<768px) — hamburger CSS owns that layout.
       if (window.innerWidth < 768) {
         allLinks.forEach(a => a.classList.remove('is-overflow'));
@@ -1565,59 +1677,12 @@ window.addEventListener('DOMContentLoaded', () => {
             a.classList.add('is-overflow');
           }
         });
-        rebuildMoreMenu();
-        return;
       }
-      // Iteratively hide low-priority links until the link strip fits.
-      // .top-nav has overflow:hidden and .nav-left has flex-shrink:1, so
-      // an overflowing strip silently clips rather than pushing
-      // nav-right out — bounding-rect math on .nav-left lies. Instead
-      // measure the *intrinsic* widths of the parts (independent of
-      // current clipping) and compare to the viewport. SAFETY absorbs
-      // the .top-nav side padding + nav-right inner gaps + sub-pixel
-      // rounding (the historic #1055 bug was a 6–20px overlap).
-      //
-      // #1105 MINOR 3: at the 1101px media-query flip `.nav-stats`
-      // toggles from display:none → flex (and vice-versa). The resize
-      // handler is rAF-debounced and runs *after* the layout flip, so
-      // navRightEl.scrollWidth measured here reflects the post-flip
-      // intrinsic width — not stale pre-flip width.
-      const navBrand   = document.querySelector('.nav-brand');
-      const SAFETY     = 32;
-      // #1105 MINOR 1+2: read both gap values from CSS rather than a
-      // shared `GUTTER = 24` constant. Today `.nav-left` (gap between
-      // brand/links/more/right cells) and `.nav-links` (gap between
-      // individual link items) both resolve to --space-lg = 24px, but
-      // they're conceptually distinct gaps. If --space-lg or .nav-left's
-      // gap diverges in the future, the fit math must follow.
-      const navLeftGap = parseFloat(getComputedStyle(navLeft).columnGap ||
-                                    getComputedStyle(navLeft).gap || '0') || 0;
-      // #1105 MINOR 1: compute the More-button reserve from its actual
-      // rendered width on first measure, instead of a hard-coded 70px
-      // fallback. Cached so we don't re-measure (offsetWidth is 0 when
-      // display:none; we capture the value the first time it's visible).
+      // The flex strip shrinks to the actual room left by the brand, More,
+      // statistics and optional account control. Measure its overflow rather
+      // than guessing those widths and gaps from the viewport.
       function fits() {
-        const visibleLinks = allLinks.filter(a => !a.classList.contains('is-overflow'));
-        let linkW = 0;
-        visibleLinks.forEach(a => { linkW += a.getBoundingClientRect().width; });
-        const linkGapPx = parseFloat(getComputedStyle(linksContainer).columnGap ||
-                                     getComputedStyle(linksContainer).gap || '0') || 0;
-        const linksGap = Math.max(0, visibleLinks.length - 1) * linkGapPx;
-        const brandW = navBrand ? navBrand.getBoundingClientRect().width : 0;
-        // Always reserve space for the More button if anything could
-        // overflow. Measure the live width when visible and cache it
-        // for use when the button is currently hidden (display:none →
-        // getBoundingClientRect() returns 0). MORE_BTN_RESERVE_PX is
-        // the conservative initial fallback used until we get a real
-        // measurement.
-        const moreVis = !navMoreWrap.classList.contains('is-hidden');
-        const liveMoreW = moreVis ? navMoreWrap.getBoundingClientRect().width : 0;
-        if (liveMoreW > 0) cachedMoreW = liveMoreW;
-        const moreW = liveMoreW > 0 ? liveMoreW
-                    : (cachedMoreW > 0 ? cachedMoreW : MORE_BTN_RESERVE_PX);
-        const rightW  = navRightEl.scrollWidth; // intrinsic, ignores clipping
-        const needed  = brandW + navLeftGap + linkW + linksGap + navLeftGap + moreW + navLeftGap + rightW + SAFETY;
-        return needed <= window.innerWidth;
+        return linksContainer.scrollWidth <= linksContainer.clientWidth;
       }
       let i = 0;
       // #1391: rebuild queue here so it reflects the CURRENT active
@@ -1674,26 +1739,33 @@ window.addEventListener('DOMContentLoaded', () => {
           console.warn('[nav] More menu floor: overflowQueue exhausted with 1 item; cannot enforce >=2 floor');
         }
       }
+      // Keep the primary/active floor. Optional stats yield first, then
+      // compact desktop spacing without reducing button touch targets.
+      if (!fits()) navTop.classList.add('nav-hide-stats');
+      if (!fits()) navTop.classList.add('nav-compact');
       rebuildMoreMenu();
     }
 
     // Run once on load, again after fonts settle (label widths shift),
     // and on resize (debounced via rAF).
-    navPriorityFn = applyNavPriority;
+    navPriorityFn = scheduleNavPriority;
     applyNavPriority();
     if (document.fonts && document.fonts.ready) {
-      document.fonts.ready.then(applyNavPriority);
+      document.fonts.ready.then(scheduleNavPriority);
     }
     let rafId = 0;
-    window.addEventListener('resize', function() {
+    function scheduleNavPriority() {
       if (rafId) cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(applyNavPriority);
-    });
+    }
+    window.addEventListener('resize', scheduleNavPriority);
+    window.addEventListener('cs-auth-control-added', scheduleNavPriority);
+    window.addEventListener('cs-auth-changed', scheduleNavPriority);
     // Re-apply on route change too: the active link gets bigger padding
     // (background pill), so which links fit can shift between pages.
     window.addEventListener('hashchange', function() {
       // Defer so the route handler's class toggles run first.
-      requestAnimationFrame(applyNavPriority);
+      scheduleNavPriority();
     });
 
     // #1406: position the fixed dropdown relative to the More button on each open.
@@ -1850,9 +1922,9 @@ window.addEventListener('DOMContentLoaded', () => {
     searchTimeout = setTimeout(async () => {
       try {
         const [packets, nodes, channels, reported] = await Promise.all([
-          fetch('/api/packets?limit=5&hash=' + encodeURIComponent(q)).then(r => r.json()).catch(() => ({ packets: [] })),
-          fetch('/api/nodes?search=' + encodeURIComponent(q)).then(r => r.json()).catch(() => []),
-          fetch('/api/channels').then(r => r.json()).catch(() => []),
+          CSApi.fetch('/api/packets?limit=5&hash=' + encodeURIComponent(q)).then(r => r.json()).catch(() => ({ packets: [] })),
+          CSApi.fetch('/api/nodes?search=' + encodeURIComponent(q)).then(r => r.json()).catch(() => []),
+          CSApi.fetch('/api/channels').then(r => r.json()).catch(() => []),
           // Repeaters known only from their reported name are not in /api/nodes.
           window.ReportedNodes ? window.ReportedNodes.load() : Promise.resolve({ nodes: [] })
         ]);
@@ -1931,7 +2003,7 @@ window.addEventListener('DOMContentLoaded', () => {
         el.innerHTML = `<span class="stat-val">${stats.totalPackets}</span> pkts · <span class="stat-val">${stats.totalNodes}</span> nodes · <span class="stat-val">${stats.totalObservers}</span> obs`;
         el.querySelectorAll('.stat-val').forEach(s => s.classList.add('updated'));
         setTimeout(() => { el.querySelectorAll('.stat-val').forEach(s => s.classList.remove('updated')); }, 600);
-        if (navPriorityFn) requestAnimationFrame(navPriorityFn);
+        if (navPriorityFn) navPriorityFn();
       }
     } catch {}
   }
@@ -1947,7 +2019,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // --- Theme Customization ---
   // Fetch theme config and apply via customizer v2 pipeline
-  fetch('/api/config/theme', { cache: 'no-store' }).then(r => r.json()).then(cfg => {
+  CSApi.fetch('/api/config/theme', { cache: 'no-store' }).then(r => r.json()).then(cfg => {
     // Normalize timestamp defaults
     cfg = cfg || {};
     if (!cfg.timestamps) cfg.timestamps = {};
@@ -2137,6 +2209,8 @@ function makeColumnsResizable(tableSelector, storageKey) {
   // Add resize handles
   ths.forEach((th, i) => {
     if (i === ths.length - 1) return;
+    // Anchor the handle to static headers without overriding sticky headers.
+    if (getComputedStyle(th).position === 'static') th.style.position = 'relative';
     const handle = document.createElement('div');
     handle.className = 'col-resize-handle';
     handle.addEventListener('mousedown', (e) => {

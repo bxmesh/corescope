@@ -1,7 +1,6 @@
 /* === CoreScope — node-analytics.js === */
 'use strict';
 (function () {
-  const PAYLOAD_LABELS = { 0: 'Request', 1: 'Response', 2: 'Direct Msg', 3: 'ACK', 4: 'Advert', 5: 'Channel Msg', 7: 'Anon Req', 8: 'Path', 9: 'Trace', 11: 'Control' };
   const CHART_COLORS = ['#4a9eff', '#ff6b6b', '#51cf66', '#fcc419', '#cc5de8', '#20c997', '#ff922b', '#845ef7', '#f06595', '#339af0'];
   const GRADE_COLORS = { A: '#51cf66', 'A-': '#51cf66', 'B+': '#339af0', B: '#339af0', C: '#fcc419', D: '#ff6b6b' };
   const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -200,7 +199,7 @@
               <tbody>${data.peerInteractions.map(p => `<tr>
                 <td><a href="#/nodes/${encodeURIComponent(p.peer_key)}" style="color:var(--link-color)">${escapeHtml(p.peer_name)}</a></td>
                 <td>${p.messageCount}</td>
-                <td>${timeAgo(p.lastContact)}</td>
+                <td>${renderTimestampHtml(p.lastContact)}</td>
               </tr>`).join('')}</tbody>
             </table></div>
           </div>` : ''}
@@ -290,7 +289,7 @@
     const c = new Chart(ctx, {
       type: 'doughnut',
       data: {
-        labels: items.map(i => PAYLOAD_LABELS[i.payload_type] || 'Type ' + i.payload_type),
+        labels: items.map(i => window.PayloadLabels.api.displayName(i.payload_type)),
         datasets: [{ data: items.map(i => i.count), backgroundColor: items.map((_, i) => CHART_COLORS[i % CHART_COLORS.length]) }]
       },
       options: { responsive: true, plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } } }
@@ -379,14 +378,16 @@
     const thr = (data && data.thresholds) || { low_mv: 3300, critical_mv: 3000 };
 
     if (badge) {
-      const STATUS_COLOR = { ok: '#51cf66', low: '#fcc419', critical: '#ff6b6b', unknown: 'var(--text-muted)' };
+      const STATUS_COLOR = { ok: 'var(--success)', low: 'var(--warning)', critical: 'var(--danger)', unknown: 'var(--text-muted)' };
       const label = data && data.status === 'ok' ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-battery-high"/></svg> OK'
         : data && data.status === 'low' ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg> Low'
         : data && data.status === 'critical' ? '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-battery-low"/></svg> Critical'
         : 'No data';
-      const mv = data && data.latest_mv ? ' · ' + data.latest_mv + ' mV' : '';
-      badge.textContent = label + mv;
-      badge.style.color = STATUS_COLOR[(data && data.status) || 'unknown'];
+      const mv = data && data.latest_mv != null ? ' · ' + data.latest_mv + ' mV' : '';
+      badge.innerHTML = label; // Only fixed status markup is parsed as HTML.
+      badge.insertAdjacentText('beforeend', mv);
+      badge.style.color = Object.prototype.hasOwnProperty.call(STATUS_COLOR, data && data.status)
+        ? STATUS_COLOR[data.status] : STATUS_COLOR.unknown;
     }
 
     if (!ctx || samples.length === 0) {

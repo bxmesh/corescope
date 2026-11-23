@@ -64,6 +64,7 @@ async function run() {
     localStorage.setItem('meshcore-user-level', 'experienced');
     localStorage.setItem('meshcore-my-nodes', JSON.stringify(nodes.map((n) => ({ pubkey: n.pk, name: n.name, addedAt: 0 }))));
     localStorage.setItem('meshcore-favorites', JSON.stringify(nodes.map((n) => n.pk)));
+    window.addEventListener('theme-refresh', () => { window.__themeReady = true; }, { once: true });
   }, NODES);
   const page = await ctx.newPage();
   page.setDefaultTimeout(15000);
@@ -81,6 +82,8 @@ async function run() {
   console.log(`\nRunning role-aware health status E2E tests against ${BASE}\n`);
 
   await page.goto(`${BASE}/#/home`, { waitUntil: 'domcontentloaded' });
+  // The initial theme refresh rebuilds Home, clearing any selected health card.
+  await page.waitForFunction(() => window.__themeReady === true);
   await page.waitForSelector('#myNodesGrid .my-node-card');
 
   await test('every mocked node was fetched from /api/nodes/<pk>/health', async () => {
@@ -142,18 +145,31 @@ async function run() {
   });
   await ctx.close();
 
-  // The analytics network status and the live node panel use the same helper
-  // with their own timestamps (last_heard || last_seen, and last_seen).
+  // The analytics network status and the live node panel use the shared
+  // role thresholds. Live also uses the newest certain activity (#2233).
   const listNode = (n) => ({ public_key: n.pk, name: n.name, role: n.role, last_heard: n.lastHeard, last_seen: n.lastSeen || n.lastHeard });
   const nodeListUrl = /\/api\/nodes(?:\?.*)?$/;
 
-  await test('analytics network status counts each node by its role', async () => {
+  await test('analytics status and role counts follow the selected nodes (#2213)', async () => {
     const actx = await browser.newContext({ viewport: { width: 1400, height: 900 } });
     const p = await actx.newPage();
     const errs = [];
     p.on('pageerror', (e) => errs.push(e.message));
-    await p.route(nodeListUrl, (route) => route.fulfill({ json: { nodes: NODES.map(listNode), total: NODES.length, counts: {} } }));
+    await p.route(nodeListUrl, (route) => {
+      const params = new URL(route.request().url()).searchParams;
+      let nodes = params.get('region') === 'SJC' ? NODES.slice(0, 3) : NODES;
+      if (params.get('area') === 'rooms') nodes = nodes.filter(n => n.role === 'room');
+      if (params.get('area') === 'empty') nodes = [];
+      return route.fulfill({ json: {
+        nodes: nodes.map(listNode), total: nodes.length, has_more: false,
+        counts: { repeater: 9000, companion: 8000, room: 7000, sensor: 6000, observer: 5000, unknown: 4000 },
+      } });
+    });
     await p.route(/\/api\/nodes\/bulk-health/, (route) => route.fulfill({ json: [] }));
+    await p.route('**/api/config/regions', (route) => route.fulfill({ json: { SJC: 'Test Region' } }));
+    await p.route('**/api/config/areas', (route) => route.fulfill({ json: [
+      { key: 'rooms', label: 'Rooms' }, { key: 'empty', label: 'Empty' },
+    ] }));
     await p.goto(`${BASE}/#/analytics?tab=nodes`, { waitUntil: 'domcontentloaded' });
     const cards = p.locator('.analytics-section', { hasText: 'Network Status' }).first().locator('.analytics-stat-card');
     await cards.first().waitFor();
@@ -161,21 +177,67 @@ async function run() {
     const got = [await count(0), await count(1), await count(2)];
     // active: rptr 5h; degraded: rptr 30h, rptr DB 30h; silent: room 80h, comp 30h, sensor never
     assert(JSON.stringify(got) === '[1,2,3]', `active/degraded/silent = ${JSON.stringify(got)}, want [1,2,3]`);
+    async function checkRoles(expected, total) {
+      await p.waitForFunction(want => {
+        const cards = document.querySelectorAll('#analyticsContent .analytics-stat-card');
+        return cards.length === 4 && Number(cards[3].firstElementChild.textContent) === want;
+      }, total);
+      const counts = await p.evaluate(() => {
+        const heading = [...document.querySelectorAll('#analyticsContent h3')].find(h => h.textContent.includes('Role Breakdown'));
+        return Object.fromEntries([...heading.nextElementSibling.querySelectorAll('.badge')].map(b => {
+          const [role, count] = b.textContent.trim().split(': ');
+          return [role, Number(count)];
+        }));
+      });
+      const want = { repeater: 0, companion: 0, room: 0, sensor: 0, observer: 0, unknown: 0, ...expected };
+      assert(Object.keys(counts).length === Object.keys(want).length &&
+        Object.entries(want).every(([role, count]) => counts[role] === count),
+      'filtered role counts: ' + JSON.stringify(counts) + ', expected ' + JSON.stringify(want));
+    }
+    await checkRoles({ repeater: 3, companion: 1, room: 1, sensor: 1 }, 6);
+    await p.evaluate(() => window.RegionFilter.setSelected(['SJC']));
+    await checkRoles({ repeater: 2, room: 1 }, 3);
+    for (const area of ['rooms', 'empty']) {
+      await p.locator('#analyticsAreaFilter .region-dropdown-trigger').click();
+      await p.locator(`#analyticsAreaFilter [data-area="${area}"]`).click();
+      await checkRoles(area === 'rooms' ? { room: 1 } : {}, area === 'rooms' ? 1 : 0);
+    }
     assert(errs.length === 0, 'page errors: ' + errs.join(' | '));
     await actx.close();
   });
 
-  const LIVE = { healthy: ['health-green', 'Online'], degraded: ['health-yellow', 'Degraded'], silent: ['health-red', 'Offline'] };
+  const LIVE = { healthy: ['health-green', 'Online'], degraded: ['health-yellow', 'Degraded'], silent: ['health-red', 'Offline'], uncertain: ['text-muted', 'Uncertain'] };
+  const fresh = ago(30 * 60 * 1000), stale = ago(120 * H);
+  const liveCases = [
+    ...[byPk[pk('a')], byPk[pk('e')], byPk[pk('d')]].map(n => ({ ...n, activity: n.lastSeen || n.lastHeard })),
+    { pk: pk('1'), name: 'Certain relay', role: 'repeater', lastSeen: stale, lastHeard: fresh, activity: fresh, want: 'healthy' },
+    { pk: pk('2'), name: 'Room health newer', role: 'room', lastSeen: stale, lastHeard: stale, healthHeard: fresh, activity: fresh, want: 'healthy' },
+    { pk: pk('3'), name: 'Companion traffic', role: 'companion', lastSeen: stale, lastHeard: fresh, activity: fresh, want: 'healthy' },
+    { pk: pk('4'), name: 'Node newer than health', role: 'repeater', lastSeen: stale, lastHeard: fresh, healthHeard: stale, activity: fresh, want: 'healthy' },
+    { pk: pk('5'), name: 'Ambiguous repeater', role: 'repeater', lastSeen: stale, lastRelayed: fresh, activity: stale, want: 'uncertain' },
+    { pk: pk('6'), name: 'Ambiguous room', role: 'room', lastSeen: stale, lastRelayed: fresh, activity: stale, want: 'uncertain' },
+    { pk: pk('7'), name: 'Ambiguous companion', role: 'companion', lastSeen: stale, lastRelayed: fresh, activity: stale, want: 'silent' },
+    { pk: pk('8'), name: 'Never heard', role: 'repeater', lastHeard: null, activity: null, want: 'silent' },
+    { pk: pk('9'), name: 'Missing health', role: 'room', lastSeen: 'bad date', lastHeard: fresh, healthFailed: true, activity: fresh, want: 'healthy' },
+  ];
   await test('live node panel shows each node\'s status by its role', async () => {
-    for (const n of [byPk[pk('a')], byPk[pk('e')], byPk[pk('d')]]) {
+    for (const n of liveCases) {
       const lctx = await browser.newContext({ viewport: { width: 1400, height: 900 } });
       const p = await lctx.newPage();
-      const node = listNode(n);
+      const errs = [];
+      p.on('pageerror', e => errs.push(e.message));
+      const node = { ...listNode(n), last_relayed: n.lastRelayed };
       await p.route(nodeListUrl, (route) => route.fulfill({ json: { nodes: [{ ...node, lat: 1, lon: 1 }], total: 1 } }));
       await p.route('**/api/nodes/' + n.pk, (route) => route.fulfill({ json: { node, recentAdverts: [] } }));
-      await p.route('**/api/nodes/' + n.pk + '/health', (route) => route.fulfill({ json: healthFor(n) }));
+      await p.route('**/api/nodes/' + n.pk + '/health', (route) => n.healthFailed
+        ? route.fulfill({ status: 500, json: { error: 'Unavailable' } })
+        : route.fulfill({ json: healthFor({ ...n, lastHeard: n.healthHeard || n.lastHeard }) }));
+      await p.route('**/api/nodes/' + n.pk + '/paths', (route) => route.fulfill({ json: { paths: [] } }));
       // live.js re-renders the panel on the first 'theme-refresh'; assert after it.
       await p.addInitScript(() => {
+        localStorage.setItem('meshcore-timestamp-mode', 'absolute');
+        localStorage.setItem('meshcore-timestamp-timezone', 'utc');
+        localStorage.setItem('meshcore-timestamp-format', 'iso');
         window.addEventListener('theme-refresh', () => { window.__themeReady = true; }, { once: true });
       });
       await p.goto(`${BASE}/#/live?lat=1&lon=1&zoom=10`, { waitUntil: 'domcontentloaded' });
@@ -183,13 +245,19 @@ async function run() {
       await p.waitForFunction(() => window.__themeReady === true, null, { timeout: 8000 });
       await p.waitForFunction((name) => {
         const c = document.getElementById('nodeDetailContent');
-        return c && c.textContent.includes(name) && /health-(green|yellow|red)/.test(c.innerHTML);
+        return c && c.textContent.includes(name) && c.querySelector('table');
       }, n.name);
       const [dotCls, label] = LIVE[n.want];
-      const dot = await p.locator('#nodeDetailContent [class^="health-"]').first().getAttribute('class');
+      const dot = await p.locator('#nodeDetailContent h3').locator('..').locator('span').first().getAttribute('class');
       assert(dot === dotCls, `${n.name}: dot "${dot}", want ${dotCls}`);
       const labels = await p.locator('#nodeDetailContent span').filter({ hasText: new RegExp(`^${label}$`) }).count();
       assert(labels >= 1, `${n.name}: no "${label}" label in the live panel`);
+      const activity = p.locator('#nodeDetailContent tr').filter({ has: p.locator('td', { hasText: /^Last Activity$/ }) });
+      assert(await activity.count() === 1, `${n.name}: Last Activity row is missing`);
+      const timestamp = await activity.locator('.timestamp-text').innerText();
+      const expected = n.activity ? n.activity.replace('T', ' ').slice(0, 19) : '—';
+      assert(timestamp === expected, `${n.name}: activity "${timestamp}", want "${expected}"`);
+      assert(errs.length === 0, `${n.name}: page errors: ${errs.join(' | ')}`);
       await lctx.close();
     }
   });

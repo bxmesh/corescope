@@ -7,6 +7,7 @@
  */
 'use strict';
 const fs = require('fs');
+const { loadApiBase } = require('./api-base-sandbox');
 const path = require('path');
 const vm = require('vm');
 
@@ -34,7 +35,9 @@ function load() {
   const calls = [];
   const nav = { gen: 0 };
   const hop = { loads: 0 };
-  const mkEl = () => ({ style: {}, textContent: '', innerHTML: '' });
+  const mkEl = () => ({ style: {}, textContent: '', innerHTML: '',
+    insertAdjacentText(position, text) { this.textContent += text; },
+  });
   const ctx = {
     console, Math, JSON, Date, Number, String, Array, Object, Promise, isNaN, setTimeout,
     getComputedStyle: () => ({ getPropertyValue: () => '' }),
@@ -51,6 +54,7 @@ function load() {
   // The battery card of whatever page is on screen.
   ['batteryStatusBadge', 'batteryEmpty', 'batteryChart'].forEach((id) => { els[id] = mkEl(); });
   vm.createContext(ctx);
+  loadApiBase(ctx);
   vm.runInContext(SRC, ctx);
   // The shared #app container; time-range buttons are wired after a render.
   const buttons = {};
@@ -61,7 +65,7 @@ function load() {
     })),
   };
   const call = (prefix) => calls.filter((c) => c.url.startsWith(prefix));
-  return { page, app, els, nav, hop, buttons, call };
+  return { ctx, page, app, els, nav, hop, buttons, call };
 }
 
 // The real router in public/app.js, so the generation the pages read is the
@@ -79,6 +83,7 @@ function loadRouter() {
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     location: { hash: '' }, history: { replaceState() {} }, CustomEvent: class {},
     document: {
+      title: 'CoreScope',
       readyState: 'complete', body: { classList: { toggle() {}, add() {}, remove() {} } },
       createElement: () => ({}), head: { appendChild() {} },
       getElementById: (id) => (id === 'app' ? app : null),
@@ -89,6 +94,7 @@ function loadRouter() {
   ctx.addEventListener = (t, fn) => { listeners[t] = fn; };
   ctx.dispatchEvent = () => {};
   vm.createContext(ctx);
+  loadApiBase(ctx);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', '..', 'public/roles.js'), 'utf8'), ctx);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', '..', 'public/app.js'), 'utf8'), ctx);
   const go = (hash) => { ctx.location.hash = hash; listeners.hashchange(); };
@@ -96,6 +102,42 @@ function loadRouter() {
 }
 
 (async () => {
+  console.log('Router: current view in the browser title (#2259)');
+  {
+    const r = loadRouter();
+    for (const page of ['home', 'packets', 'packet-detail', 'nodes', 'node-analytics', 'node-reach', 'observer-detail', 'analytics', 'account']) {
+      r.ctx.registerPage(page, { init() {}, destroy() {} });
+    }
+    for (const [hash, title] of [
+      ['#/home', 'CoreScope'],
+      ['#/packets', 'Packets | CoreScope'],
+      ['#/nodes', 'Nodes | CoreScope'],
+      ['#/nodes/' + PK, 'Node abababababab | CoreScope'],
+      ['#/nodes/' + PK + '/reach', 'Node abababababab | Reach | CoreScope'],
+      ['#/nodes/' + PK + '/analytics', 'Node abababababab | Analytics | CoreScope'],
+      ['#/packet/123', 'Packet 123 | CoreScope'],
+      ['#/packets/abcdef?obs=2', 'Packet abcdef | CoreScope'],
+      ['#/observers/observer-one', 'Observer observer-one | CoreScope'],
+      ['#/account/login', 'Account | CoreScope'],
+      ['#/account/activate?token=sample-value', 'Account | CoreScope'],
+      ['#/account/reset/sample-value', 'Account | CoreScope'],
+      ['#/home', 'CoreScope'],
+    ]) {
+      r.go(hash);
+      assert(r.ctx.document.title === title, hash + ': ' + title);
+    }
+    assert(typeof r.ctx.setSiteTitle === 'function' && typeof r.ctx.setRouteTitle === 'function',
+      'branding and detail updates have shared title helpers');
+    if (r.ctx.setSiteTitle && r.ctx.setRouteTitle) {
+      r.go('#/nodes');
+      r.ctx.setSiteTitle('Example Mesh');
+      assert(r.ctx.document.title === 'Nodes | Example Mesh', 'late branding preserves the current page');
+      r.ctx.setRouteTitle('packets', 'late-packet');
+      assert(r.ctx.document.title === 'Nodes | Example Mesh', 'a detail callback from another page cannot replace the title');
+      r.ctx.setSiteTitle('  ');
+      assert(r.ctx.document.title === 'Nodes | CoreScope', 'blank branding falls back without accumulating suffixes');
+    }
+  }
   console.log('Router: viewGeneration()');
   {
     const r = loadRouter();
@@ -208,6 +250,83 @@ function loadRouter() {
     t.call('/nodes/')[0].reject(new Error('server down'));
     await flush();
     assert(t.app.innerHTML.includes('Failed to load analytics: server down'), 'the current rejection renders');
+  }
+
+  console.log('Node Analytics: battery badge separates icons from data (#2232)');
+  for (const [status, mv, label, color] of [
+    ['ok', 4100, 'OK', 'var(--success)'],
+    ['low', 3200, 'Low', 'var(--warning)'],
+    ['critical', 2900, 'Critical', 'var(--danger)'],
+    ['critical', 0, 'Critical', 'var(--danger)'],
+    ['unknown', null, 'No data', 'var(--text-muted)'],
+    ['constructor', null, 'No data', 'var(--text-muted)'],
+    ['ok', '<img src=x onerror=alert(1)>', 'OK', 'var(--success)'],
+  ]) {
+    const t = load();
+    t.page.init(t.app, PK + '/analytics');
+    t.call('/nodes/')[0].resolve(analyticsData(7));
+    await flush();
+    t.call('/nodes/' + PK + '/battery')[0].resolve({ status, latest_mv: mv, samples: [] });
+    await flush();
+    const badge = t.els.batteryStatusBadge;
+    assert(badge.innerHTML.includes(label), status + ': trusted badge label is rendered');
+    assert(!badge.textContent.includes('<svg'), status + ': SVG source is not displayed as text');
+    assert(!badge.innerHTML.includes('<img'), status + ': voltage never enters HTML');
+    assert(badge.textContent === (mv == null ? '' : ' · ' + mv + ' mV'), status + ': voltage is appended as text, including zero');
+    assert(badge.style.color === color, status + ': badge uses its theme color');
+  }
+
+  console.log('Node Analytics: Last Contact timestamps (#1154 U10)');
+  for (const [name, lastContact, settings, text, title] of [
+    ['relative UTC', '2024-01-02T03:04:05.123Z', {}, '1h ago', '2024-01-02 03:04:05'],
+    ['absolute UTC', '2024-01-02T03:04:05.123Z', { mode: 'absolute' }, '2024-01-02 03:04:05', '1h ago'],
+    ['milliseconds', '2024-01-02T03:04:05.123Z', { format: 'iso-seconds' }, '1h ago', '2024-01-02 03:04:05.123'],
+    ['custom format escaping', '2024-01-02T03:04:05.123Z', { 'custom-format': 'YYYY-MM-DD <clock> "Z"' },
+      '1h ago', '2024-01-02 &lt;clock&gt; &quot;UTC&quot;'],
+    ['custom absolute escaping', '2024-01-02T03:04:05.123Z', { mode: 'absolute', 'custom-format': 'YYYY-MM-DD <clock> "Z"' },
+      '2024-01-02 &lt;clock&gt; &quot;UTC&quot;', '1h ago'],
+    ['future', '2024-01-02T05:04:05.123Z', {}, '2024-01-02 05:04:05', 'in 1h'],
+    ['null', null, {}, '—', '—'],
+    ['missing', undefined, {}, '—', '—'],
+    ['empty', '', {}, '—', '—'],
+    ['invalid', 'not-a-date', {}, '—', '—'],
+  ]) {
+    const t = load();
+    const shared = loadRouter().ctx;
+    shared.Date = class extends Date { static now() { return Date.parse('2024-01-02T04:04:05.123Z'); } };
+    shared.SITE_CONFIG = { timestamps: { allowCustomFormat: true } };
+    const prefs = Object.assign({ mode: 'ago', timezone: 'utc', format: 'iso' }, settings);
+    shared.localStorage.getItem = (key) => prefs[key.replace('meshcore-timestamp-', '')] || null;
+    t.ctx.timeAgo = shared.timeAgo;
+    t.ctx.formatTimestampWithTooltip = shared.formatTimestampWithTooltip;
+    t.ctx.escapeHtml = shared.escapeHtml;
+    // Load the actual page renderers alongside app.js, including its shared
+    // helpers; no copied timestamp formatting or markup in the test.
+    for (const file of ['payload-labels.js', 'nodes.js', 'packets.js']) {
+      vm.runInContext(fs.readFileSync(path.join(__dirname, '..', '..', 'public', file), 'utf8'), shared);
+    }
+    t.ctx.renderTimestampHtml = shared.renderTimestampHtml;
+    t.page.init(t.app, PK + '/analytics');
+    const data = analyticsData(7);
+    data.peerInteractions = [{ peer_key: 'cd'.repeat(32), peer_name: 'Example Peer', messageCount: 3, lastContact }];
+    t.call('/nodes/')[0].resolve(data);
+    await flush();
+    const cells = [...t.app.innerHTML.matchAll(/<td>([\s\S]*?)<\/td>/g)];
+    const contact = cells[2] && cells[2][1];
+    assert(!!contact && contact.includes('title="' + title + '"'), name + ': Last Contact has the expected tooltip');
+    const display = contact && contact.match(/<span class="timestamp-text"[^>]*>([\s\S]*?)<\/span>/);
+    assert(!!display && display[1] === text, name + ': Last Contact has the expected display text');
+    const future = name === 'future';
+    assert(!!contact && contact.includes('class="timestamp-future-icon"') === future,
+      name + ': only future contacts show a clock warning');
+    if (future) {
+      assert(contact.includes('title="Timestamp is in the future — node clock may be skewed"') &&
+        contact.includes('phosphor-sprite.svg#ph-warning'), 'future: clock warning explains the skew');
+    }
+    const node = shared._nodesRenderNodeTimestampHtml(lastContact);
+    const packet = shared._packetsTestAPI.renderTimestampCell(lastContact);
+    assert(node === packet, name + ': Nodes and Packets preserve identical timestamp markup');
+    assert(contact === node, name + ': Last Contact matches the existing Nodes timestamp');
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);
