@@ -143,6 +143,53 @@ var migrations = [][]string{
 			expires_at INTEGER NOT NULL
 		)`,
 	},
+	// v7: personal MQTT logins for observers, and the observer pubkeys bound
+	// to their owners (first claim wins; NULL user_id = orphaned).
+	{
+		`CREATE TABLE mqtt_logins (
+			user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+			username TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			password_enc TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			revoked_at INTEGER,
+			last_auth_at INTEGER
+		)`,
+		`CREATE TABLE observer_bindings (
+			pubkey TEXT PRIMARY KEY,
+			user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+			bound_at INTEGER NOT NULL,
+			bound_by TEXT NOT NULL CHECK (bound_by IN ('auto','admin'))
+		)`,
+		`CREATE INDEX observer_bindings_user ON observer_bindings(user_id)`,
+	},
+	// v8: confirmed_at is set once the owner's own personal login has
+	// published under the bound pubkey; 'auto' bindings are born from that
+	// login, so they count as confirmed at bound_at.
+	{
+		`ALTER TABLE observer_bindings ADD COLUMN confirmed_at INTEGER`,
+		`UPDATE observer_bindings SET confirmed_at = bound_at WHERE bound_by = 'auto'`,
+	},
+	// v9: repeater claims and community-maintained repeater details.
+	{
+		`CREATE TABLE repeater_claims (
+			pubkey TEXT NOT NULL,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			claimed_at INTEGER NOT NULL,
+			PRIMARY KEY (pubkey, user_id)
+		)`,
+		`CREATE INDEX repeater_claims_user ON repeater_claims(user_id)`,
+		`CREATE TABLE repeater_info (
+			pubkey TEXT PRIMARY KEY,
+			height_m REAL,
+			gain_dbi REAL NOT NULL DEFAULT 0,
+			status TEXT CHECK (status IN ('active','maintenance','decommissioned')),
+			power TEXT CHECK (power IN ('mains','battery','solar')),
+			notes TEXT NOT NULL DEFAULT '',
+			updated_at INTEGER NOT NULL,
+			updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+		)`,
+	},
 }
 
 func (s *Store) migrate() error {

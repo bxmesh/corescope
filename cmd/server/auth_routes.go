@@ -43,6 +43,7 @@ func (s *Server) registerAuthRoutes(r *mux.Router) {
 	r.HandleFunc("/api/account/companions", s.withUser(s.handleCompanionList)).Methods("GET")
 	r.HandleFunc("/api/account/companions", s.withUser(s.handleCompanionLink)).Methods("POST")
 	r.HandleFunc("/api/account/companions/{pubkey}", s.withUser(s.handleCompanionDelete)).Methods("DELETE")
+	s.registerRepeaterRoutes(r)
 	r.HandleFunc("/api/account/export", s.withUser(s.handleAccountExport)).Methods("GET")
 	r.HandleFunc("/api/admin/users", s.withAdmin(s.handleAdminUsers)).Methods("GET")
 	r.HandleFunc("/api/admin/users/{id}", s.withAdmin(s.handleAdminUserDetail)).Methods("GET")
@@ -58,6 +59,18 @@ func (s *Server) registerAuthRoutes(r *mux.Router) {
 	r.HandleFunc("/api/admin/users-backup", s.withAdmin(s.handleAdminUsersBackup)).Methods("GET")
 	if s.auth.set.proposals.enabled {
 		s.registerProposalRoutes(r)
+	}
+	// Broker hooks: no session, only the shared secret header.
+	if s.auth.set.observerLogins.enabled {
+		r.HandleFunc("/api/mqtt-hook/emqx/authn", s.handleEMQXAuthn).Methods("POST")
+		r.HandleFunc("/api/mqtt-hook/emqx/authz", s.handleEMQXAuthz).Methods("POST")
+		r.HandleFunc("/api/account/observer-login", s.withUser(s.handleObserverLoginGet)).Methods("GET")
+		r.HandleFunc("/api/account/observer-login", s.withUser(s.handleObserverLoginCreate)).Methods("POST")
+		r.HandleFunc("/api/account/observer-login/resend", s.withUser(s.handleObserverLoginResend)).Methods("POST")
+		r.HandleFunc("/api/admin/observer-logins", s.withAdmin(s.handleAdminObserverLogins)).Methods("GET")
+		r.HandleFunc("/api/admin/observer-logins/{id}/revoke", s.withAdmin(s.handleAdminObserverLoginRevoke)).Methods("POST")
+		r.HandleFunc("/api/admin/observer-logins/{id}/reissue", s.withAdmin(s.handleAdminObserverLoginReissue)).Methods("POST")
+		r.HandleFunc("/api/admin/observer-bindings/{pubkey}", s.withAdmin(s.handleAdminObserverBinding)).Methods("PUT")
 	}
 	if s.auth.notify != nil {
 		s.registerNotifyRoutes(r)

@@ -25,6 +25,7 @@ type authService struct {
 	hook        *rateLimiter
 	settingsPut *rateLimiter // PUT /api/account/settings, per user
 	companion   *rateLimiter // companion challenge + link, per IP and per user
+	repeater    *rateLimiter // repeater edit, claim and unclaim, per user
 
 	// approved is the snapshot of approved hashtag channel names, filled at
 	// construction and reloaded from users.db after every proposal decision.
@@ -36,6 +37,15 @@ type authService struct {
 	// notify evaluates node notifications; nil unless
 	// userManagement.notifications.enabled.
 	notify *notifier
+
+	// obsIdx answers the broker hooks; nil unless observerLogins.enabled
+	// (or when its load failed, see newAuthService).
+	obsIdx  *observerLoginIndex
+	touches authTouches
+	// sealbox seals and opens the stored observer passwords; nil when the
+	// feature is off or the key is unusable.
+	sealbox *users.SecretBox
+	now     func() time.Time
 
 	warnIndistinct sync.Once
 	stop           chan struct{}
@@ -53,9 +63,25 @@ func newAuthService(set *userMgmtSettings, st *users.Store, m mailer.Mailer) *au
 		hook:        newRateLimiter(600, time.Minute),
 		settingsPut: newRateLimiter(60, time.Hour),
 		companion:   newRateLimiter(60, time.Hour),
+		repeater:    newRateLimiter(120, time.Hour),
 		stop:        make(chan struct{}),
+		now:         time.Now,
 	}
 	a.refreshApproved()
+	if set.observerLogins.enabled {
+		// No error return here: a failed load leaves obsIdx nil, the hook
+		// routes answer 503 and the broker falls back to its own users.
+		idx, err := newObserverLoginIndex(st, set.observerLogins.sharedUsernames)
+		if err != nil {
+			log.Printf("[observer-logins] load logins: %v", err)
+		} else {
+			a.obsIdx = idx
+		}
+		if a.sealbox, err = users.NewSecretBox(set.observerLogins.key); err != nil {
+			log.Printf("[observer-logins] secret box: %v", err)
+			a.sealbox = nil
+		}
+	}
 	return a
 }
 
@@ -178,6 +204,7 @@ func (a *authService) prune() {
 	a.hook.gc()
 	a.settingsPut.gc()
 	a.companion.gc()
+	a.repeater.gc()
 }
 
 func (a *authService) isConfigAdmin(email string) bool { return a.set.adminEmails[email] }

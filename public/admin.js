@@ -5,6 +5,7 @@
  *   users     window.CSAdminUsers    (admin-users.js)
  *   audit     window.CSAdminAudit    (admin-audit.js)
  *   proposals window.CSAdminProposals (admin-proposals.js), only with channel proposals on
+ *   observer-logins window.CSAdminObserverLogins (admin-observer-logins.js), only with observer logins on
  * Deep link: #/admin?tab=<tab>&<tab filters>. The old #/admin/users?... is
  * rewritten to #/admin?tab=users&... with replaceState. Access relies on
  * the server's withAdmin check and CSAuth.isAdmin(); the shell adds no
@@ -15,9 +16,11 @@
     { id: 'overview', label: 'Overview', mod: 'CSAdminOverview' },
     { id: 'users', label: 'Users', mod: 'CSAdminUsers' },
     { id: 'audit', label: 'Audit', mod: 'CSAdminAudit' },
-    { id: 'proposals', label: 'Proposals', mod: 'CSAdminProposals', when: proposalsOn }
+    { id: 'proposals', label: 'Proposals', mod: 'CSAdminProposals', when: proposalsOn },
+    { id: 'observer-logins', label: 'Observer logins', mod: 'CSAdminObserverLogins', when: observerLoginsOn }
   ];
   function proposalsOn() { return !!(window.MC_USER_MGMT && window.MC_USER_MGMT.channelProposals); }
+  function observerLoginsOn() { return !!(window.MC_USER_MGMT && window.MC_USER_MGMT.observerLogins); }
   function visibleTabs() { return TABS.filter(function (t) { return !t.when || t.when(); }); }
   // The page on screen, whether it was rendered for an admin, and the
   // mounted tab, so an auth change can redirect or re-render.
@@ -65,6 +68,7 @@
       history.replaceState(null, '', legacy);
       routeParam = null;
     }
+    if (CSApi.anonymous) { app.innerHTML = page('<h2>Admin</h2>' + CSBeta.classicOnlyHtml('Administration')); return Promise.resolve(); }
     app.innerHTML = page('<p>Loading…</p>');
     var ready = window.CSAuth ? CSAuth.ready() : Promise.resolve();
     return ready.then(function () {

@@ -1,6 +1,39 @@
 /* === CoreScope — observer-detail.js === */
 'use strict';
 
+// Issue #1869 — every radio setting the observer reported, so a retune shows
+// as a change instead of silently relabelling everything heard before it.
+// Only rendered once there is more than one stretch to list. Window global
+// like the banner below, so the XSS sink test can call it directly; every
+// field is observer-published (MQTT status) and escaped here.
+window.ObserverDetailRadioHistory = {
+  render: function (history) {
+    if (!Array.isArray(history) || history.length < 2) return '';
+    var cell = 'padding:3px 8px';
+    var radioText = function (r) {
+      return window.RfParams && window.RfParams.radioText ? window.RfParams.radioText(r) : escapeHtml(r || '');
+    };
+    var when = function (t) {
+      var d = new Date(t);
+      return escapeHtml(isNaN(d.getTime()) ? String(t || '') : d.toLocaleString());
+    };
+    var rows = history.slice().reverse().map(function (h) {
+      return '<tr><td style="' + cell + '">' + radioText(h.radio) + '</td>' +
+        '<td style="' + cell + '">' + (h.radio_id ? escapeHtml(h.radio_id) : '<span class="text-muted">main</span>') + '</td>' +
+        '<td style="' + cell + '">' + when(h.first_seen) + '</td>' +
+        '<td style="' + cell + '">' + when(h.last_seen) + '</td></tr>';
+    }).join('');
+    return '<div class="node-full-card" data-testid="observer-radio-history" style="margin-bottom:20px;padding:12px">' +
+      '<h4 style="margin:0 0 6px">Radio history</h4>' +
+      '<table style="border-collapse:collapse;font-size:0.85em"><thead><tr>' +
+      '<th style="' + cell + ';text-align:left">Setting</th><th style="' + cell + ';text-align:left">Radio</th>' +
+      '<th style="' + cell + ';text-align:left">From</th><th style="' + cell + ';text-align:left">Last reported</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table>' +
+      '<div class="text-muted" style="font-size:12px;margin-top:6px">Packets carry the setting the observer was on when it heard them.</div>' +
+      '</div>';
+  },
+};
+
 // Issue #1478 — naive-clock banner for observer detail page.
 // Exposed as a window global so a jsdom-style test can call it directly.
 // Returns the banner HTML when clock_naive is true, or "" when clean.
@@ -41,12 +74,12 @@ window.ObserverDetailNaiveBanner = {
 };
 
 (function () {
-  const PAYLOAD_LABELS = { 0: 'Request', 1: 'Response', 2: 'Direct Msg', 3: 'ACK', 4: 'Advert', 5: 'Channel Msg', 7: 'Anon Req', 8: 'Path', 9: 'Trace', 11: 'Control' };
   const CHART_COLORS = ['#4a9eff', '#ff6b6b', '#51cf66', '#fcc419', '#cc5de8', '#20c997', '#ff922b', '#845ef7', '#f06595', '#339af0'];
 
   let charts = [];
   let currentDays = 7;
   let currentId = null;
+  let detailGeneration = 0;
 
   function destroyCharts() {
     charts.forEach(c => { try { c.destroy(); } catch {} });
@@ -70,6 +103,7 @@ window.ObserverDetailNaiveBanner = {
   }
 
   function init(app, routeParam) {
+    currentDays = 7;
     currentId = routeParam;
     if (!currentId) {
       app.innerHTML = '<div class="text-center text-muted" style="padding:40px">No observer ID specified.</div>';
@@ -82,7 +116,7 @@ window.ObserverDetailNaiveBanner = {
           <a href="#/observers" class="btn-icon" title="Back to Observers" aria-label="Back">←</a>
           <h2 style="margin:0" id="obsTitle">Observer Detail</h2>
           <a href="#/nodes/${encodeURIComponent(currentId.toLowerCase())}" class="btn-secondary" title="View this pubkey as a node" style="text-decoration:none;font-size:12px;padding:4px 10px">View node detail →</a>
-          <div style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <div style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap;max-width:100%">
             <span class="compare-with-group">
               <label class="sr-only" for="obsCompareWithPicker">Compare with another observer</label>
               <select id="obsCompareWithPicker" data-action="compare-with-picker"
@@ -135,26 +169,55 @@ window.ObserverDetailNaiveBanner = {
   }
 
   function destroy() {
+    detailGeneration++;
     destroyCharts();
     currentId = null;
   }
 
   async function loadDetail() {
+    const generation = ++detailGeneration;
+    const observerId = currentId;
+    const days = currentDays;
     try {
       destroyCharts();
-      chartDefaults();
-      const [obs, analytics, obsSkewArr] = await Promise.all([
-        api('/observers/' + encodeURIComponent(currentId)),
-        api('/observers/' + encodeURIComponent(currentId) + '/analytics?days=' + currentDays),
-        api('/observers/clock-skew', { ttl: 30000 }).catch(function() { return []; }),
-      ]);
-      // Find this observer's calibration data.
-      var obsSkew = null;
-      (Array.isArray(obsSkewArr) ? obsSkewArr : []).forEach(function(s) {
-        if (s && s.observerID === currentId) obsSkew = s;
+      // Start all requests together, but only identity gates the first render.
+      // Capture analytics errors immediately, even if identity is still pending.
+      const observerRequest = api('/observers/' + encodeURIComponent(observerId));
+      const analyticsRequest = api('/observers/' + encodeURIComponent(observerId) + '/analytics?days=' + days)
+        .then(data => ({ data }), error => ({ error }));
+      const skewRequest = api('/observers/clock-skew', { ttl: 30000 }).catch(function() { return []; });
+      const obs = await observerRequest;
+      // Only the latest load of the current visit owns the detail view.
+      if (generation !== detailGeneration) return;
+      renderDetail(obs);
+      analyticsRequest.then(result => {
+        if (generation !== detailGeneration) return;
+        const el = document.getElementById('obsAnalytics');
+        if (!el) return;
+        try {
+          if (result.error) throw result.error;
+          renderAnalytics(result.data);
+        } catch (error) {
+          destroyCharts();
+          el.innerHTML = '<div class="text-muted" role="status"></div>';
+          el.firstChild.textContent = 'Error: ' + error.message;
+        }
+        el.setAttribute('aria-busy', 'false');
       });
-      renderDetail(obs, analytics, obsSkew);
+      skewRequest.then(obsSkewArr => {
+        if (generation !== detailGeneration) return;
+        // Preserve the last matching calibration from the bulk response.
+        var obsSkew = null;
+        (Array.isArray(obsSkewArr) ? obsSkewArr : []).forEach(function(s) {
+          if (s && s.observerID === observerId) obsSkew = s;
+        });
+        renderClockOffset(obsSkew);
+      }).catch(() => {
+        if (generation !== detailGeneration) return;
+        renderClockOffset(null);
+      });
     } catch (e) {
+      if (generation !== detailGeneration) return;
       // SECURITY (OBS-2, PR #1539): use textContent for error messages.
       // Error.message is JS-controlled and shouldn't normally carry attacker
       // strings, but textContent is a one-line defense against an upstream
@@ -167,7 +230,7 @@ window.ObserverDetailNaiveBanner = {
     }
   }
 
-  function renderDetail(obs, analytics, obsSkew) {
+  function renderDetail(obs) {
     const el = document.getElementById('obsDetailContent');
     if (!el) return;
 
@@ -267,6 +330,14 @@ window.ObserverDetailNaiveBanner = {
           <div class="stat-label">Last Status Update</div>
           <div class="stat-value" style="font-size:0.85em">${obs.last_seen ? timeAgo(obs.last_seen) + '<br><span style="font-size:0.8em;color:var(--text-muted)">' + new Date(obs.last_seen).toLocaleString() + '</span>' : '—'}</div>
         </div>
+        <div class="stat-card" data-testid="obs-stat-neighbors-report">
+          <div class="stat-label">Neighbors Report</div>
+          <div class="stat-value" style="font-size:0.85em">${obs.neighbors_report_at && window.ObserverNeighbors ? window.ObserverNeighbors.since(obs.neighbors_report_at, Date.now()) : '<span style="color:var(--text-muted)">never</span>'}</div>
+        </div>
+        <div class="stat-card" data-testid="obs-stat-neighbors-count">
+          <div class="stat-label">Neighbors</div>
+          <div class="stat-value">${obs.neighbors_count != null && isFinite(Number(obs.neighbors_count)) ? Number(obs.neighbors_count) : '—'}</div>
+        </div>
         <div class="stat-card">
           <div class="stat-label">Last Packet Observation</div>
           <div class="stat-value" style="font-size:0.85em">${obs.last_packet_at ? timeAgo(obs.last_packet_at) + '<br><span style="font-size:0.8em;color:var(--text-muted)">' + new Date(obs.last_packet_at).toLocaleString() + '</span>' : '<span style="color:var(--text-muted)">never</span>'}</div>
@@ -275,7 +346,16 @@ window.ObserverDetailNaiveBanner = {
       <div class="mono" style="font-size:0.75em;color:var(--text-muted);margin-bottom:20px;word-break:break-all">
         ID: ${escapeHtml(obs.id)}
       </div>
-      ${obsSkew && obsSkew.samples > 0 ? `
+      <div id="obsClockOffset" aria-busy="true"><div class="text-muted" role="status" style="margin-bottom:20px">Loading clock calibration…</div></div>
+      ${window.ObserverDetailRadioHistory ? window.ObserverDetailRadioHistory.render(obs.radio_history) : ''}
+      ${window.ObserverNeighbors ? window.ObserverNeighbors.detailHtml(obs.neighbor_report) : ''}
+      <div id="obsAnalytics" aria-busy="true"><div class="text-muted" role="status">Loading analytics…</div></div>`;
+  }
+
+  function renderClockOffset(obsSkew) {
+    const el = document.getElementById('obsClockOffset');
+    if (!el) return;
+    el.innerHTML = obsSkew && obsSkew.samples > 0 ? `
       <div class="node-full-card skew-detail-section" style="margin-bottom:20px;padding:12px">
         <h4 style="margin:0 0 6px"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-clock"/></svg> Clock Offset</h4>
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -286,15 +366,23 @@ window.ObserverDetailNaiveBanner = {
         <div style="font-size:12px;color:var(--text-muted);margin-top:8px;max-width:600px">
           <strong>How this is computed:</strong> when this observer and another observer see the same packet, we compare their receive timestamps. The median deviation across all multi-observer packets is this observer's offset.
         </div>
-      </div>` : ''}
-      <div class="obs-charts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:16px">
+      </div>` : '';
+    el.setAttribute('aria-busy', 'false');
+  }
+
+  function renderAnalytics(analytics) {
+    const el = document.getElementById('obsAnalytics');
+    if (!el) return;
+    chartDefaults();
+    el.innerHTML = `
+      <div class="obs-charts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,400px),1fr));gap:16px">
         <div class="chart-card" style="padding:12px">
           <h3 style="margin:0 0 8px;font-size:0.95em">Packets Over Time</h3>
           <canvas id="obsTimeChart" role="img" aria-label="Packets over time chart"></canvas>
         </div>
         <div class="chart-card" style="padding:12px">
           <h3 style="margin:0 0 8px;font-size:0.95em">Packet Types</h3>
-          <div style="max-width:280px;margin:0 auto"><canvas id="obsTypeChart" role="img" aria-label="Packet types chart"></canvas></div>
+          <div style="max-width:280px;aspect-ratio:1;margin:0 auto"><canvas id="obsTypeChart" role="img" aria-label="Packet types chart"></canvas></div>
         </div>
         <div class="chart-card" style="padding:12px">
           <h3 style="margin:0 0 8px;font-size:0.95em">Unique Nodes Heard</h3>
@@ -358,7 +446,7 @@ window.ObserverDetailNaiveBanner = {
   function renderTypeChart(types) {
     const ctx = document.getElementById('obsTypeChart');
     if (!ctx) return;
-    const labels = Object.keys(types).map(k => PAYLOAD_LABELS[k] || 'Type ' + k);
+    const labels = Object.keys(types).map(k => window.PayloadLabels.api.displayName(k));
     const values = Object.values(types);
     const c = new Chart(ctx, {
       type: 'doughnut',
@@ -443,7 +531,7 @@ window.ObserverDetailNaiveBanner = {
         const hops = (typeof window !== 'undefined' && window.MC_filterPathHops)
           ? window.MC_filterPathHops(rawHops)
           : rawHops;
-        const typeName = PAYLOAD_LABELS[p.payload_type] || 'Type ' + p.payload_type;
+        const typeName = window.PayloadLabels.api.displayName(p.payload_type);
         return `<tr style="cursor:pointer" tabindex="0" role="row" data-action="navigate" data-value="#/packets/${p.hash || p.id}">
           <td>${timeAgo(p.timestamp)}</td>
           <td>${typeName}</td>

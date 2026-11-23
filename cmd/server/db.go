@@ -706,6 +706,7 @@ type PacketQuery struct {
 	Type               *int
 	Route              *int
 	Observer           string
+	ExcludeTx          bool // require a non-TX observation from the selected observer(s), or any observer if unscoped
 	Hash               string
 	Since              string
 	Until              string
@@ -713,6 +714,7 @@ type PacketQuery struct {
 	Area               string // area key; filters by transmitting node's GPS position
 	Node               string
 	Channel            string // channel_hash filter (#812). Plain names like "#test"/"public" or "enc_<HEX>" for encrypted
+	Radio              string // canonical "MHz,kHz,SF,CR": some observation heard on it (#1869; in-memory store only)
 	Order              string // ASC or DESC
 	ExpandObservations bool   // when true, include observation sub-maps in txToMap output
 }
@@ -1014,18 +1016,24 @@ func (db *DB) buildTransmissionWhere(q PacketQuery) ([]string, []interface{}) {
 		where = append(where, "t.channel_hash = ?")
 		args = append(args, q.Channel)
 	}
+	directionFilter := ""
+	if q.ExcludeTx {
+		directionFilter = " AND oi.direction IS NOT 'tx'"
+	}
 	if q.Observer != "" {
 		ids := strings.Split(q.Observer, ",")
 		placeholders := strings.Repeat("?,", len(ids))
 		placeholders = placeholders[:len(placeholders)-1]
 		if db.isV3 {
-			where = append(where, "EXISTS (SELECT 1 FROM observations oi JOIN observers obi ON obi.rowid = oi.observer_idx WHERE oi.transmission_id = t.id AND obi.id IN ("+placeholders+"))")
+			where = append(where, "EXISTS (SELECT 1 FROM observations oi JOIN observers obi ON obi.rowid = oi.observer_idx WHERE oi.transmission_id = t.id AND obi.id IN ("+placeholders+")"+directionFilter+")")
 		} else {
-			where = append(where, "EXISTS (SELECT 1 FROM observations oi WHERE oi.transmission_id = t.id AND oi.observer_id IN ("+placeholders+"))")
+			where = append(where, "EXISTS (SELECT 1 FROM observations oi WHERE oi.transmission_id = t.id AND oi.observer_id IN ("+placeholders+")"+directionFilter+")")
 		}
 		for _, id := range ids {
 			args = append(args, strings.TrimSpace(id))
 		}
+	} else if q.ExcludeTx {
+		where = append(where, "EXISTS (SELECT 1 FROM observations oi WHERE oi.transmission_id = t.id"+directionFilter+")")
 	}
 	if q.Region != "" {
 		if db.isV3 {
@@ -3325,7 +3333,7 @@ func (db *DB) GetScopeStats(window string) (*ScopeStatsResponse, error) {
 	if err := row.Scan(
 		&resp.Summary.TransportTotal,
 		&resp.Summary.Scoped,
-		&resp.Summary.Unscoped,
+		&resp.Summary.UnscopedTransport,
 		&resp.Summary.UnknownScope,
 	); err != nil {
 		return nil, fmt.Errorf("scope summary query: %w", err)
@@ -3335,14 +3343,19 @@ func (db *DB) GetScopeStats(window string) (*ScopeStatsResponse, error) {
 	// transport_code_1 per MeshCore protocol, so they are inherently unscoped.
 	// Fold their count into Summary.Unscoped so the analytics denominator
 	// reflects total-observed-transmissions rather than only transport-eligible.
-	var nonTransportUnscoped int
+	// #2364: keep the per-route split and report Total so the summary adds up.
+	// Same single scan as before; the CASE split costs nothing extra.
 	if err := db.conn.QueryRow(`
-		SELECT COUNT(*) FROM transmissions
+		SELECT
+			COALESCE(SUM(CASE WHEN route_type = 1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN route_type = 2 THEN 1 ELSE 0 END), 0)
+		FROM transmissions
 		WHERE `+routeTypeNonTransportSQL+` AND first_seen >= ?
-	`, since).Scan(&nonTransportUnscoped); err != nil {
+	`, since).Scan(&resp.Summary.UnscopedFlood, &resp.Summary.UnscopedDirect); err != nil {
 		return nil, fmt.Errorf("scope non-transport count query: %w", err)
 	}
-	resp.Summary.Unscoped += nonTransportUnscoped
+	resp.Summary.Unscoped = resp.Summary.UnscopedTransport + resp.Summary.UnscopedFlood + resp.Summary.UnscopedDirect
+	resp.Summary.Total = resp.Summary.Scoped + resp.Summary.Unscoped
 
 	// Per-region counts (named regions only)
 	rows, err := db.conn.Query(scopeStatsByRegionQuery, since)

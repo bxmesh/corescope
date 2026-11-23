@@ -195,12 +195,11 @@ func newResolver(pm *prefixMap) func(string) string {
 //
 // Both columns are optional: they are added by migration and an older database
 // simply lacks them, so each is gated on the schema flag the handle probed at
-// open time. Every return value is best-effort — a missing row, a missing
-// column or a scan error yields empty strings, because a reach report must
-// still render for a node we know nothing else about.
-func (s *Server) reachNodeScopes(ctx context.Context, pubkey string) (string, string, string) {
+// open time. Missing rows or optional columns yield empty strings; query and
+// scan failures must abort the build rather than cache missing scope data.
+func (s *Server) reachNodeScopes(ctx context.Context, pubkey string) (string, string, string, error) {
 	if s.db == nil || s.db.conn == nil {
-		return "", "", ""
+		return "", "", "", nil
 	}
 	cols := make([]string, 0, 3)
 	if s.db.hasDefaultScope {
@@ -210,7 +209,7 @@ func (s *Server) reachNodeScopes(ctx context.Context, pubkey string) (string, st
 		cols = append(cols, "configured_scope", "configured_scope_at")
 	}
 	if len(cols) == 0 {
-		return "", "", ""
+		return "", "", "", nil
 	}
 	vals := make([]sql.NullString, len(cols))
 	args := make([]interface{}, len(cols))
@@ -220,7 +219,10 @@ func (s *Server) reachNodeScopes(ctx context.Context, pubkey string) (string, st
 	row := s.db.conn.QueryRowContext(ctx,
 		"SELECT "+strings.Join(cols, ", ")+" FROM nodes WHERE public_key = ?", pubkey)
 	if err := row.Scan(args...); err != nil {
-		return "", "", ""
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", "", nil
+		}
+		return "", "", "", err
 	}
 	out := map[string]string{}
 	for i, c := range cols {
@@ -228,7 +230,7 @@ func (s *Server) reachNodeScopes(ctx context.Context, pubkey string) (string, st
 			out[c] = vals[i].String
 		}
 	}
-	return out["default_scope"], out["configured_scope"], out["configured_scope_at"]
+	return out["default_scope"], out["configured_scope"], out["configured_scope_at"], nil
 }
 
 type NodeReachInfo struct {
@@ -333,12 +335,15 @@ type reachCacheEntry struct {
 type reachState struct {
 	cacheMu sync.RWMutex
 	cache   map[string]reachCacheEntry
-	// buildSem bounds how many cold-cache reach scans run at the same time.
+	// cold bounds how many cold-cache reach scans run at the same time.
 	// singleflight only collapses identical keys; distinct (pubkey, days)
 	// keys each start a scan, and the endpoint is unauthenticated, so
 	// without a cap a handful of requests can hold every SQLite reader.
-	buildSemOnce sync.Once
-	buildSem     chan struct{}
+	// Zero value is ready to use (see node_reach_cold_limit.go).
+	cold reachColdLimiter
+	// beforeFlight is a test hook run between the cache check and the
+	// singleflight call; nil in production.
+	beforeFlight func()
 	// sf dedups concurrent cold-cache requests for the same key so N
 	// simultaneous callers run the scan + attribution once, not N times.
 	sf singleflight.Group
@@ -492,19 +497,23 @@ func (s *Server) handleNodeReach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.reach.beforeFlight != nil {
+		s.reach.beforeFlight()
+	}
 	// singleflight: collapse a thundering herd on a cold key to one scan. The
 	// shared computation uses the triggering request's context; a disconnect
-	// there can cancel the in-flight scan for all waiters (acceptable — the
-	// next request recomputes).
+	// there cancels it for all waiters, and those still connected get 429
+	// (below), so their retry recomputes.
 	v, err, _ := s.reach.sf.Do(cacheKey, func() (interface{}, error) {
 		if raw, ok := s.reachCacheGet(cacheKey); ok {
 			return raw, nil
 		}
-		release, ok := s.reachAcquireBuildSlot()
-		if !ok {
-			return nil, errReachBusy
+		// Taken only here, after the cache recheck: a warm hit never waits
+		// for a slot, and a coalesced herd on one key takes one slot.
+		if aErr := s.reach.cold.acquire(r.Context()); aErr != nil {
+			return nil, aErr
 		}
-		defer release()
+		defer s.reach.cold.release()
 		resp, ok, cErr := s.computeNodeReach(r.Context(), pubkey, days)
 		if cErr != nil {
 			// Real backend failure (e.g. DB scan exploded) — propagate so the
@@ -523,9 +532,16 @@ func (s *Server) handleNodeReach(w http.ResponseWriter, r *http.Request) {
 		s.reachCachePut(cacheKey, raw)
 		return raw, nil
 	})
-	if errors.Is(err, errReachBusy) {
-		w.Header().Set("Retry-After", strconv.Itoa(reachBusyRetryAfterSeconds))
-		writeError(w, http.StatusTooManyRequests, "too many reach computations in progress, retry shortly")
+	if errors.Is(err, errReachColdBusy) {
+		writeReachColdBusy429(w)
+		return
+	}
+	// The shared computation runs on the context of the request that started
+	// it. If that request went away (while queued for a slot or mid-scan), a
+	// caller that is still connected was not at fault: tell it to retry, as
+	// for a busy limiter, instead of answering 500. Nothing was cached.
+	if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && r.Context().Err() == nil {
+		writeReachColdBusy429(w)
 		return
 	}
 	if err != nil {
@@ -583,7 +599,10 @@ func (s *Server) computeNodeReach(ctx context.Context, pubkey string, days int) 
 
 	// #1865: scopes for the report header. Single-row lookup rather than widening
 	// buildNodeInfoMap's bulk SELECT, which every other consumer would pay for.
-	defScope, confScope, confAt := s.reachNodeScopes(ctx, pubkey)
+	defScope, confScope, confAt, err := s.reachNodeScopes(ctx, pubkey)
+	if err != nil {
+		return NodeReachResponse{}, false, err
+	}
 
 	// assemble links
 	links := make([]NodeReachLink, 0, len(d.we)+len(d.they))
@@ -647,6 +666,9 @@ func (s *Server) computeNodeReach(ctx context.Context, pubkey string, days int) 
 	sort.Strings(toks)
 
 	selfLat, selfLon := gpsPtrs(self)
+	if err := ctx.Err(); err != nil {
+		return NodeReachResponse{}, false, err
+	}
 	return NodeReachResponse{
 		Node: NodeReachInfo{Pubkey: pubkey, Name: self.Name, Role: self.Role,
 			Lat: selfLat, Lon: selfLon, FirstSeen: firstSeen,
@@ -722,11 +744,16 @@ func (s *Server) getDegreeSnapshot(ctx context.Context) *degreeSnapshot {
 	for rows.Next() {
 		var pk string
 		var neigh int
-		if rows.Scan(&pk, &neigh) != nil {
-			continue
+		if err := rows.Scan(&pk, &neigh); err != nil {
+			log.Printf("[reach] degree snapshot scan failed: %v (serving stale)", err)
+			return stale
 		}
 		deg[strings.ToLower(pk)] = neigh
 		sortedDesc = append(sortedDesc, neigh)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[reach] degree snapshot iteration failed: %v (serving stale)", err)
+		return stale
 	}
 	sort.Sort(sort.Reverse(sort.IntSlice(sortedDesc)))
 	snap := &degreeSnapshot{at: time.Now(), total: len(deg), deg: deg, sortedDesc: sortedDesc}
@@ -842,29 +869,6 @@ func (s *Server) readReachRows(ctx context.Context, q string, args []interface{}
 		return nil, err
 	}
 	return out, nil
-}
-
-// reachMaxConcurrentBuilds is the number of cold-cache reach scans allowed at
-// once. Two keeps half of the default 4-connection SQLite pool free for
-// every other handler while a scan runs.
-const reachMaxConcurrentBuilds = 2
-
-// reachBusyRetryAfterSeconds is the Retry-After we send with a 429.
-const reachBusyRetryAfterSeconds = 5
-
-// errReachBusy is returned inside the singleflight when no build slot is free.
-var errReachBusy = errors.New("reach: too many concurrent builds")
-
-// reachAcquireBuildSlot takes a build slot without blocking. It returns a
-// release func and true, or nil and false when all slots are busy.
-func (s *Server) reachAcquireBuildSlot() (func(), bool) {
-	s.reach.buildSemOnce.Do(func() { s.reach.buildSem = make(chan struct{}, reachMaxConcurrentBuilds) })
-	select {
-	case s.reach.buildSem <- struct{}{}:
-		return func() { <-s.reach.buildSem }, true
-	default:
-		return nil, false
-	}
 }
 
 // reachHopIndexCovers reports whether observation_hops can answer a window that
