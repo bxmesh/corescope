@@ -1,6 +1,6 @@
 # CLAUDE.md — bxmesh/corescope
 
-BXMesh's fork of upstream CoreScope, kept only until upstream has our change: read
+BXMesh's fork of upstream CoreScope, for a change upstream doesn't have: read
 [`BXMESH.md`](BXMESH.md) first. Read
 [`zindello-cluster/cluster-docs`](https://github.com/zindello-cluster/cluster-docs) before doing
 anything here: its `CLAUDE.md`, the spec (`spec/design.md`), the binding layout (`spec/layout.md`)
