@@ -1,8 +1,8 @@
 # BXMesh's fork of CoreScope
 
 This is [Kpa-clawbot/CoreScope](https://github.com/Kpa-clawbot/CoreScope) (GPL-3.0), forked for
-BXMesh's CoreScope at corescope.bxmesh.net, only until upstream has the change we need
-(cluster-docs: `spec/layout.md`, O292).
+BXMesh's CoreScope at corescope.bxmesh.net, for a change upstream doesn't have (cluster-docs:
+`spec/layout.md`, O292). Nothing here goes upstream (O720).
 
 ## Our patch
 
@@ -41,8 +41,9 @@ the bump there. BXMesh never deploys itself: the owner merges and syncs (O14).
 ## A new upstream release
 
 1. Each morning the `upstream` workflow opens an issue when upstream has a release we haven't merged.
-2. Read its changelog. If upstream now has all three defaults, or settings for them, stop here and
-   retire the fork (below).
+2. Read its changelog. If upstream now has a change that does the same as one of ours (any of the
+   three defaults, or a setting for them), weigh it on its merits and ask the owner: keep ours or
+   take upstream's. Never drop ours just because upstream has it (O723).
 3. `bxmesh/sync.sh vX.Y.Z` merges it into a new branch, `upstream-vX.Y.Z`, keeps upstream's
    workflows out, records the release and runs the tests. Push it and open a pull request to
    `bxmesh` with the changelog, risks and rollback; the owner merges it.
@@ -50,5 +51,6 @@ the bump there. BXMesh never deploys itself: the owner merges and syncs (O14).
 
 ## Retiring the fork
 
-When upstream has all three: point `corescope.bxmesh.net`'s Dockerfile back at
-`ghcr.io/kpa-clawbot/corescope`, archive this repo, and take its row out of the layout.
+Only once the owner has chosen upstream's version of all three defaults (O723): point
+`corescope.bxmesh.net`'s Dockerfile back at `ghcr.io/kpa-clawbot/corescope`, archive this repo,
+and take its row out of the layout.
